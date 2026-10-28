@@ -7,6 +7,7 @@ No production configuration, subscription, firewall, or service is modified.
 from __future__ import annotations
 
 import copy
+from contextlib import ExitStack
 import hashlib
 import http.server
 import json
@@ -15,6 +16,7 @@ from pathlib import Path
 import re
 import shutil
 import socket
+import socketserver
 import ssl
 import subprocess
 import tempfile
@@ -102,7 +104,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def profiles(core: str, cert: Path, key: Path) -> list[dict]:
+class CamouflageHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        self.server.connections += 1
+        self.request.settimeout(5)
+        try:
+            with self.server.context.wrap_socket(self.request, server_side=True) as connection:
+                # REALITY needs the TLS 1.3 handshake, not an HTTP download from
+                # the camouflage endpoint. Wait for its normal close/first byte.
+                connection.recv(1)
+        except OSError:
+            pass
+
+
+class CamouflageTarget(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, cert: Path, key: Path):
+        self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.context.minimum_version = ssl.TLSVersion.TLSv1_3
+        self.context.maximum_version = ssl.TLSVersion.TLSv1_3
+        self.context.set_ecdh_curve("X25519")
+        self.context.set_alpn_protocols(["h2", "http/1.1"])
+        self.context.load_cert_chain(cert, key)
+        self.connections = 0
+        super().__init__(("127.0.0.1", 0), CamouflageHandler)
+        self.thread = threading.Thread(target=self.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.shutdown()
+        self.server_close()
+        self.thread.join(timeout=5)
+
+
+def profiles(core: str, cert: Path, key: Path, camouflage_port: int) -> list[dict]:
     generated = run([core, "vlessenc"])
     dec = re.findall(r'"decryption"\s*:\s*"([^\"]+)"', generated.stdout)
     enc = re.findall(r'"encryption"\s*:\s*"([^\"]+)"', generated.stdout)
@@ -118,6 +158,7 @@ def profiles(core: str, cert: Path, key: Path) -> list[dict]:
         "SMOKE_PRIVATE": private[1], "SMOKE_PUBLIC": public[1],
         "SMOKE_RAW_PORT": str(port()), "SMOKE_REALITY_PORT": str(port()),
         "SMOKE_HY2_PORT": str(port(True)), "SMOKE_XHTTP_PORT": str(port()),
+        "SMOKE_CAMOUFLAGE_PORT": str(camouflage_port),
     })
     shell = r'''
 source ./install.sh
@@ -139,7 +180,7 @@ REALITY_PRIVATE_KEY="$SMOKE_PRIVATE"
 REALITY_PUBLIC_KEY="$SMOKE_PUBLIC"
 REALITY_SHORT_ID=0123456789abcdef
 REALITY_SERVER_NAME=localhost
-REALITY_TARGET=127.0.0.1:443
+REALITY_TARGET="127.0.0.1:$SMOKE_CAMOUFLAGE_PORT"
 prepare_node_profiles
 printf '%s\n' "$NODE_PROFILES"
 '''
@@ -158,7 +199,7 @@ def main() -> None:
     curl = shutil.which("curl.exe" if os.name == "nt" else "curl")
     if not curl:
         raise RuntimeError("curl is required")
-    with tempfile.TemporaryDirectory(prefix="3xuish-runtime-") as temp:
+    with tempfile.TemporaryDirectory(prefix="3xuish-runtime-") as temp, ExitStack() as resources:
         directory = Path(temp)
         cert, key = directory / "cert.pem", directory / "key.pem"
         result = run([executable("openssl"), "req", "-x509", "-newkey", "rsa:2048", "-nodes",
@@ -168,7 +209,16 @@ def main() -> None:
         if result.returncode:
             raise RuntimeError("Temporary test certificate generation failed")
         pin = hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert.read_text())).hexdigest()
-        items = profiles(core, cert, key)
+        camouflage = resources.enter_context(CamouflageTarget(cert, key))
+        target_tls = ssl.create_default_context(cafile=str(cert))
+        target_tls.minimum_version = ssl.TLSVersion.TLSv1_3
+        with socket.create_connection(camouflage.server_address, timeout=5) as connection:
+            with target_tls.wrap_socket(connection, server_hostname="localhost") as connection:
+                if connection.version() != "TLSv1.3":
+                    raise RuntimeError("Local camouflage target did not negotiate TLS 1.3")
+                connection.sendall(b"\n")
+        target_connections = camouflage.connections
+        items = profiles(core, cert, key, camouflage.server_address[1])
         source = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         thread = threading.Thread(target=source.serve_forever, daemon=True)
         thread.start()
@@ -209,10 +259,6 @@ def main() -> None:
             print("PASS: generated combined server and all four client configurations accepted by Xray")
             with Core(core, server_path, directory / "server.log"):
                 for label, path, socks in clients:
-                    if label == "reality":
-                        # Validating REALITY here is network-free; its camouflage target
-                        # requires an independent TLS 1.3 handshake endpoint.
-                        continue
                     with Core(core, path, directory / (label + ".log")):
                         destination = directory / (label + ".bin")
                         response = run([curl, "--silent", "--show-error", "--fail", "--proxy",
@@ -224,6 +270,11 @@ def main() -> None:
                                 hashlib.sha256(destination.read_bytes()).digest() != hashlib.sha256(BODY).digest():
                             raise RuntimeError(label + " did not complete the exact loopback payload")
                     print("PASS: " + label + " loopback download, 1 MiB with SHA256 match")
+            # REALITY borrows the target's handshake response, then may close
+            # before finishing that independent TLS session. Count acceptance,
+            # while the local preflight above verifies TLS 1.3 capability.
+            if camouflage.connections <= target_connections:
+                raise RuntimeError("REALITY did not contact the local TLS 1.3 camouflage target")
         finally:
             source.shutdown()
             source.server_close()

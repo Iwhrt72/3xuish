@@ -92,7 +92,26 @@ AUTO_YES=1 CERT_MODE=2 XUI_DOMAIN=example.com PRIMARY_NODE=hy2 bash /tmp/3xuish-
 
 节点端口和面板端口不能冲突。脚本遇到与本次部署端口冲突的已有入站或监听服务会停止并提示处理，不会盲目覆盖现有入站。
 
-全新部署命令面向未安装 3x-ui 的服务器。检测到已有数据库会停止；请通过已有面板管理节点，域名迁移使用下方的 `--switch-domain`。
+全新部署命令面向未安装 3x-ui 的服务器。已有面板请使用下面的 `--add-nodes`，域名迁移使用 `--switch-domain`。
+
+## 给已有面板添加节点
+
+此前的速度对照使用临时入口，结束后恢复原 XHTTP 并停止 REALITY、Hy2。需要长期使用时，在原服务器 root 终端执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Iwhrt72/3xuish/main/install.sh -o /tmp/3xuish-install.sh
+bash /tmp/3xuish-install.sh --add-nodes
+```
+
+此模式读取当前面板设置及现有 TLS 节点的证书，先备份数据库，再通过面板 API 新增四种节点。原节点、面板账号和证书继续使用，不重新安装面板或申请证书。
+
+默认尝试 RAW TCP `24445`、REALITY TCP `24443`、Hy2 UDP `24444` 和 XHTTP TCP `8443`，自动避开已占用端口，以最终输出为准。原 XHTTP 在 TCP `443` 时会保留，因此面板会同时有原节点和新增节点。若用环境变量显式指定端口而发生冲突，脚本会停止。
+
+新增项由面板长期管理，没有测速时的自动停止期限。重复运行会检查已保存节点并显示原链接，避免反复新增。需要开放云安全组和系统防火墙对应端口，尤其是 Hy2 的 UDP 端口。
+
+复用证书前会核对有效期、域名/IP 以及证书和私钥是否匹配。若原节点未保存正确 SNI，可用 `XUI_DOMAIN=证书覆盖的域名` 指定。重复运行也会检查证书路径、REALITY 密钥、XHTTP 路径和加密参数；面板配置与保存的链接不一致时会停止，请先核对面板配置。
+
+安装结尾显示长期节点的导入链接，请在 v2rayN 中重新导入这些链接。临时测速凭据与新建正式节点不同，不应继续使用临时链接。
 
 ## 安装后导入客户端
 
@@ -184,13 +203,15 @@ cmp install.sh install_3xui_xhttp_vlessenc.sh
 python3 -m unittest discover -s tests -v
 ```
 
-测试需要 Bash、jq、SQLite3、OpenSSL 和 Python3。单元集成测试覆盖四节点生成、主用选择、面板 API 失败回滚和域名迁移恢复。可选的真实内核测试：
+测试需要 Bash、jq、SQLite3、OpenSSL 和 Python3。单元集成测试覆盖四节点生成、主用选择、面板 API 失败回滚、域名迁移恢复、真实证书匹配、结果文件写入失败、本机 API 代理绕行以及运行配置变更。可单独运行真实内核测试：
 
 ```bash
 XRAY_BIN=/path/to/xray python3 tests/runtime_smoke.py
 ```
 
-`tests/panel_smoke.sh` 用于一次性官方 3x-ui 容器内的真实 API 验证，使用临时证书，不申请公网证书。真实内核与面板验证版本为 Xray 26.10.21、3x-ui v3.11.0。
+`tests/panel_smoke.sh` 和 `tests/existing_panel_smoke.sh` 分别验证新建四节点、已有面板追加节点与重复执行。使用一次性官方 3x-ui 容器和临时证书，不申请公网证书。`runtime_smoke.py` 对 Hy2、RAW、REALITY、XHTTP 分别执行回环下载并核对 SHA256；REALITY 使用临时本地 TLS 1.3 目标。
+
+GitHub CI 同时运行模拟测试、真实面板与真实内核测试，容器按镜像摘要固定到 3x-ui v3.11.0 / Xray 26.10.21。安装脚本仍从官方获取上游最新版；未来上游升级、实际公网 ACME 申请、云安全组和用户线路不在隔离测试的证明范围内。审计发现和复现方法见 [2026-10-28 审计报告](docs/2026-10-28_code-audit-3xuish-report.md)。
 
 ## 参考资料
 

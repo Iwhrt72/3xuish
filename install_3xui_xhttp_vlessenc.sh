@@ -239,6 +239,38 @@ detect_server_ip() {
 }
 
 # 5. 释放 80 端口并确保 acme.sh 就绪
+run_acme() {
+    ~/.acme.sh/acme.sh "$@"
+}
+
+validate_certificate_pair() {
+    local host="$1" cert="$2" key="$3" match_option cert_public key_public
+    [[ -s "$cert" && -s "$key" ]] || { fail "证书或私钥文件不存在或为空。"; return 1; }
+    openssl x509 -in "$cert" -checkend 0 -noout >/dev/null 2>&1 || {
+        fail "证书已过期或无法读取，未采用该证书。"; return 1;
+    }
+    if valid_ipv4 "$host"; then
+        match_option=-verify_ip
+    elif valid_domain "$host"; then
+        match_option=-verify_hostname
+    else
+        fail "证书目标地址无效。"; return 1
+    fi
+    # x509 -checkhost may return zero even on a name mismatch. verify has a
+    # reliable failure status and also rejects certificates not yet valid.
+    # Trusting this local leaf is only for identity/validity checks, not CA proof.
+    openssl verify -partial_chain -trusted "$cert" "$match_option" "$host" "$cert" >/dev/null 2>&1 || {
+        fail "证书不覆盖节点地址 ${host} 或尚未生效，未采用该证书。"; return 1;
+    }
+    cert_public=$(openssl x509 -in "$cert" -pubkey -noout 2>/dev/null |
+        openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256) || {
+        fail "无法读取证书公钥。"; return 1;
+    }
+    key_public=$(openssl pkey -in "$key" -passin pass: -pubout -outform DER 2>/dev/null |
+        openssl dgst -sha256) || { fail "无法读取证书私钥。"; return 1; }
+    [[ "$cert_public" == "$key_public" ]] || { fail "证书与私钥不匹配。"; return 1; }
+}
+
 prepare_acme_port80() {
     log_info "正在检查 80 端口占用情况（申请证书需要通过 80 端口验证）..."
     if command -v ss >/dev/null 2>&1 && ss -ltn | awk '{print $4}' | grep -Eq ':80$'; then
@@ -248,45 +280,46 @@ prepare_acme_port80() {
 
     if [[ ! -f ~/.acme.sh/acme.sh ]]; then
         log_info "正在安装 acme.sh..."
-        curl -fsSL --connect-timeout 10 --max-time 60 https://get.acme.sh -o "$RUN_DIR/acme-install.sh"
-        sh "$RUN_DIR/acme-install.sh" >/dev/null
+        curl -fsSL --connect-timeout 10 --max-time 60 https://get.acme.sh -o "$RUN_DIR/acme-install.sh" || {
+            fail "acme.sh 下载失败。"; return 1;
+        }
+        sh "$RUN_DIR/acme-install.sh" >/dev/null || { fail "acme.sh 安装失败。"; return 1; }
     fi
-    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt --force >/dev/null 2>&1
+    run_acme --set-default-ca --server letsencrypt --force >/dev/null 2>&1 || {
+        fail "无法配置 acme.sh 默认 CA。"; return 1;
+    }
 }
 
 # 6A. 一键申请 Let's Encrypt IP 短期证书 (6天有效期 + acme.sh 自动续期)
 issue_ip_cert() {
-    prepare_acme_port80
+    prepare_acme_port80 || return 1
     CERT_HOST="${SERVER_IP}"
     CERT_DIR="/root/cert/ip"
     CERT_FILE="${CERT_DIR}/fullchain.pem"
     KEY_FILE="${CERT_DIR}/privkey.pem"
-    mkdir -p "$CERT_DIR"
+    mkdir -p "$CERT_DIR" || return 1
 
     log_info "正在向 Let's Encrypt 申请 IP (${SERVER_IP}) SSL 证书 (shortlived 模式，自动续期)..."
-    ~/.acme.sh/acme.sh --issue \
+    run_acme --issue \
         -d "${SERVER_IP}" \
         --standalone \
         --server letsencrypt \
         --certificate-profile shortlived \
         --days 6 \
         --httpport 80 \
-        --force
+        --force || { fail "IP 证书签发失败，未使用旧文件继续部署。"; return 1; }
 
     local reload_cmd="systemctl restart x-ui 2>/dev/null || rc-service x-ui restart 2>/dev/null || true"
-    ~/.acme.sh/acme.sh --installcert --force -d "${SERVER_IP}" \
+    run_acme --installcert --force -d "${SERVER_IP}" \
         --key-file "${KEY_FILE}" \
         --fullchain-file "${CERT_FILE}" \
-        --reloadcmd "${reload_cmd}" >/dev/null 2>&1 || true
-
-    if [[ ! -s "$CERT_FILE" || ! -s "$KEY_FILE" ]]; then
-        log_error "IP 证书文件生成失败！请确认服务器防火墙/安全组已放行 TCP 80 端口。"
-        exit 1
-    fi
-
-    chmod 644 "$CERT_FILE"
-    chmod 600 "$KEY_FILE"
-    ~/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1 || true
+        --reloadcmd "${reload_cmd}" >/dev/null 2>&1 || {
+        fail "IP 证书安装或续期配置失败。"; return 1;
+    }
+    validate_certificate_pair "$CERT_HOST" "$CERT_FILE" "$KEY_FILE" || return 1
+    chmod 644 "$CERT_FILE" || return 1
+    chmod 600 "$KEY_FILE" || return 1
+    run_acme --upgrade --auto-upgrade >/dev/null 2>&1 || true
     log_info "IP 证书申请成功！存放路径: ${CERT_DIR}"
 }
 
@@ -303,35 +336,32 @@ issue_domain_cert() {
     fi
     valid_domain "$domain" || { fail "域名格式无效。"; return 1; }
 
-    prepare_acme_port80
+    prepare_acme_port80 || return 1
     CERT_HOST="${domain}"
     CERT_DIR="/root/cert/${domain}"
     CERT_FILE="${CERT_DIR}/fullchain.pem"
     KEY_FILE="${CERT_DIR}/privkey.pem"
-    mkdir -p "$CERT_DIR"
+    mkdir -p "$CERT_DIR" || return 1
 
     log_info "正在向 Let's Encrypt 申请域名 (${domain}) SSL 证书 (90天有效期，自动续期)..."
-    ~/.acme.sh/acme.sh --issue \
+    run_acme --issue \
         -d "${domain}" \
         --standalone \
         --server letsencrypt \
         --httpport 80 \
-        --force
+        --force || { fail "域名证书签发失败，未使用旧文件继续部署。"; return 1; }
 
     local reload_cmd="systemctl restart x-ui 2>/dev/null || rc-service x-ui restart 2>/dev/null || true"
-    ~/.acme.sh/acme.sh --installcert --force -d "${domain}" \
+    run_acme --installcert --force -d "${domain}" \
         --key-file "${KEY_FILE}" \
         --fullchain-file "${CERT_FILE}" \
-        --reloadcmd "${reload_cmd}" >/dev/null 2>&1 || true
-
-    if [[ ! -s "$CERT_FILE" || ! -s "$KEY_FILE" ]]; then
-        log_error "域名证书生成失败！请确认域名已解析到 ${SERVER_IP}（若开启了 Cloudflare 小黄云请先切为仅 DNS 灰色云朵）且 80 端口已放行。"
-        exit 1
-    fi
-
-    chmod 644 "$CERT_FILE"
-    chmod 600 "$KEY_FILE"
-    ~/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1 || true
+        --reloadcmd "${reload_cmd}" >/dev/null 2>&1 || {
+        fail "域名证书安装或续期配置失败。"; return 1;
+    }
+    validate_certificate_pair "$CERT_HOST" "$CERT_FILE" "$KEY_FILE" || return 1
+    chmod 644 "$CERT_FILE" || return 1
+    chmod 600 "$KEY_FILE" || return 1
+    run_acme --upgrade --auto-upgrade >/dev/null 2>&1 || true
     log_info "域名证书申请成功！存放路径: ${CERT_DIR}"
 }
 
@@ -455,8 +485,8 @@ switch_existing_to_domain() (
         # 从已保存的说明恢复面板信息；不要执行磁盘上的 shell 环境文件。
         PANEL_USER="${XUI_USERNAME:-$(sed -n 's/^管理员账号：//p' "$XUI_INFO_DIR/3x-ui-nodes-info.txt" | head -n 1)}"
         PANEL_PASS="${XUI_PASSWORD:-$(sed -n 's/^管理员密码：//p' "$XUI_INFO_DIR/3x-ui-nodes-info.txt" | head -n 1)}"
-        PANEL_PORT="${XUI_PANEL_PORT:-$(sed -nE 's#^访问地址：https://[^:]+:([0-9]+)/.*#\1#p' "$XUI_INFO_DIR/3x-ui-nodes-info.txt" | head -n 1)}"
-        WEB_BASE_PATH="${XUI_WEB_BASE_PATH:-$(sed -nE 's#^访问地址：https://[^:]+:[0-9]+/([^/]+)/.*#\1#p' "$XUI_INFO_DIR/3x-ui-nodes-info.txt" | head -n 1)}"
+        PANEL_PORT="${XUI_PANEL_PORT:-$(sed -nE 's#^访问地址：https?://[^:]+:([0-9]+)/.*#\1#p' "$XUI_INFO_DIR/3x-ui-nodes-info.txt" | head -n 1)}"
+        WEB_BASE_PATH="${XUI_WEB_BASE_PATH:-$(sed -nE 's#^访问地址：https?://[^:]+:[0-9]+/([^/]+)/.*#\1#p' "$XUI_INFO_DIR/3x-ui-nodes-info.txt" | head -n 1)}"
         WEB_BASE_PATH="${WEB_BASE_PATH#/}"; WEB_BASE_PATH="${WEB_BASE_PATH%/}"
         valid_port "$PANEL_PORT" && [[ "$WEB_BASE_PATH" =~ ^[A-Za-z0-9_-]+$ ]] || { fail "无法恢复面板地址信息，已取消域名切换。"; return 1; }
         RAW_PORT=$(jq -r '.[] | select(.key == "raw") | .port' <<<"$NODE_PROFILES")
@@ -815,8 +845,9 @@ api_request() {
 }
 
 api_init() {
-    API_BASE_URL="https://127.0.0.1:${PANEL_PORT}/${WEB_BASE_PATH}"
-    API_COMMON=(-fsSk --connect-timeout 5 --max-time 30)
+    API_BASE_URL="${PANEL_API_SCHEME:-https}://${PANEL_API_HOST:-127.0.0.1}:${PANEL_PORT}${WEB_BASE_PATH:+/$WEB_BASE_PATH}"
+    # The panel is on this server; never send its credentials through environment proxies.
+    API_COMMON=(-fsSk --noproxy '*' --connect-timeout 5 --max-time 30)
     local token_output token csrf login_response
     token_output=$("${XUI_INSTALL_DIR}/x-ui" setting -getApiToken -tokenName 3xuish-installer -tokenScope admin 2>/dev/null) || true
     token=$(printf '%s\n' "$token_output" | sed -nE 's/^[[:space:]]*apiToken:[[:space:]]*([^[:space:]]+).*/\1/p' | head -n 1)
@@ -831,6 +862,10 @@ api_init() {
         fi
     fi
     local cookie="$RUN_DIR/api-cookies.txt"
+    if [[ "${EXISTING_DEPLOYMENT:-0}" == 1 && "${PANEL_CREDENTIALS_AVAILABLE:-0}" != 1 ]]; then
+        fail "当前面板不支持管理员令牌，请用 XUI_USERNAME 和 XUI_PASSWORD 指定原面板账号密码后重试。"
+        return 1
+    fi
     csrf=$(curl "${API_COMMON[@]}" -c "$cookie" "$API_BASE_URL/csrf-token" | jq -er '.obj') || {
         fail "面板令牌和 CSRF 登录均不可用。"; return 1;
     }
@@ -865,11 +900,20 @@ rollback_created_nodes() {
 }
 
 cleanup_install() {
-    local result=$?
+    local result=$? name
     trap - EXIT
     if [[ "$result" -ne 0 && "$ROLLBACK_NEEDED" == 1 ]]; then
         log_warn "部署未完成，正在回滚本次新建入站。"
         rollback_created_nodes || true
+    fi
+    if [[ "$result" -ne 0 && -n "${EXISTING_INFO_BACKUP:-}" && -d "$EXISTING_INFO_BACKUP" ]]; then
+        for name in 3x-ui-node-profiles.json 3x-ui-nodes-info.txt 3x-ui-node-links.txt 3x-ui-xhttp-info.txt; do
+            if [[ -f "$EXISTING_INFO_BACKUP/$name" ]]; then
+                install -m 600 "$EXISTING_INFO_BACKUP/$name" "$XUI_INFO_DIR/$name" || true
+            elif [[ -f "$EXISTING_INFO_BACKUP/$name.absent" ]]; then
+                rm -f -- "$XUI_INFO_DIR/$name"
+            fi
+        done
     fi
     if [[ -n "$RUN_DIR" && -d "$RUN_DIR" && "$RUN_DIR" == /tmp/3xuish.* ]]; then
         rm -rf -- "$RUN_DIR"
@@ -918,7 +962,18 @@ verify_running_nodes() {
     local runtime="${XUI_INSTALL_DIR}/bin/config.json" profile key port listener
     for _ in {1..15}; do
         if [[ -s "$runtime" ]] && jq -e --slurpfile profiles "$RUN_DIR/profiles.json" '
+            def certificate_files:
+                [(.certificates // [])[] | {certificateFile, keyFile}]
+                | sort_by(.certificateFile, .keyFile);
+            def reality_identity:
+                {target: (.target // .dest), privateKey,
+                 serverNames: ((.serverNames // []) | sort),
+                 shortIds: ((.shortIds // []) | sort)};
+            def xhttp_identity:
+                {path: (.path // "/"), mode: (.mode // "auto"), host: (.host // "")};
             . as $config | all($profiles[0][]; . as $profile |
+                ($profile.payload.streamSettings | fromjson) as $expected_stream |
+                ($profile.payload.settings | fromjson) as $expected_settings |
                 any($config.inbounds[]; .tag == $profile.payload.tag and
                     .port == $profile.port and .protocol == $profile.payload.protocol and
                     .streamSettings.network == $profile.transport and
@@ -929,7 +984,20 @@ verify_running_nodes() {
                              .flow == "xtls-rprx-vision") end) and
                     (if .streamSettings.security == "tls" then
                         .streamSettings.tlsSettings.minVersion == "1.0" and
-                        .streamSettings.tlsSettings.maxVersion == "1.3"
+                        .streamSettings.tlsSettings.maxVersion == "1.3" and
+                        .streamSettings.tlsSettings.serverName == $expected_stream.tlsSettings.serverName and
+                        (.streamSettings.tlsSettings | certificate_files) ==
+                            ($expected_stream.tlsSettings | certificate_files)
+                     elif .streamSettings.security == "reality" then
+                        (.streamSettings.realitySettings | reality_identity) ==
+                            ($expected_stream.realitySettings | reality_identity)
+                     else true end) and
+                    (if $profile.key == "xhttp" then
+                        (.streamSettings.xhttpSettings | xhttp_identity) ==
+                            ($expected_stream.xhttpSettings | xhttp_identity)
+                     else true end) and
+                    (if .protocol == "vless" then
+                        (.settings.decryption // "none") == ($expected_settings.decryption // "none")
                      else true end) and
                     (if .protocol == "vless" and .settings.decryption != "none"
                      then (.settings | has("fallbacks") | not) else true end)))
@@ -952,7 +1020,7 @@ verify_running_nodes() {
         fi
         sleep 1
     done
-    fail "配置或监听验证失败：请检查 x-ui/Xray 日志与端口。"
+    fail "配置或监听验证失败：请核对面板中的证书、认证与传输是否和已保存节点一致，并检查 x-ui/Xray 日志与端口。"
 }
 
 # 13. 组装客户端分享链接并打印安装结果。
@@ -962,18 +1030,20 @@ write_node_files() {
     local links_file="$XUI_INFO_DIR/3x-ui-node-links.txt"
     local legacy_file="$XUI_INFO_DIR/3x-ui-xhttp-info.txt"
     local profile_file_tmp="$RUN_DIR/profiles.json"
-    install -d -m 700 "$XUI_INFO_DIR"
-    printf '%s\n' "$NODE_PROFILES" | jq -e 'length == 4' >/dev/null
-    printf '%s\n' "$NODE_PROFILES" >"$profile_file_tmp"
-    install -m 600 "$profile_file_tmp" "$profiles_file"
-    jq -r '.[].link' "$profiles_file" >"$RUN_DIR/links.txt"
-    install -m 600 "$RUN_DIR/links.txt" "$links_file"
+    # Callers use `write_node_files || return`, so every write must propagate
+    # its own failure instead of relying on Bash errexit inside this function.
+    install -d -m 700 "$XUI_INFO_DIR" || return 1
+    printf '%s\n' "$NODE_PROFILES" | jq -e 'length == 4' >/dev/null || return 1
+    printf '%s\n' "$NODE_PROFILES" >"$profile_file_tmp" || return 1
+    install -m 600 "$profile_file_tmp" "$profiles_file" || return 1
+    jq -r '.[].link' "$profiles_file" >"$RUN_DIR/links.txt" || return 1
+    install -m 600 "$RUN_DIR/links.txt" "$links_file" || return 1
     {
         printf '============================================================\n'
         printf '  3x-ui 四节点部署完成：连接信息与使用说明\n'
         printf '============================================================\n'
         printf '\n[面板]\n'
-        printf '访问地址：https://%s:%s/%s/\n' "$CERT_HOST" "$PANEL_PORT" "$WEB_BASE_PATH"
+        printf '访问地址：%s://%s:%s%s/\n' "${PANEL_API_SCHEME:-https}" "$CERT_HOST" "$PANEL_PORT" "${WEB_BASE_PATH:+/$WEB_BASE_PATH}"
         printf '管理员账号：%s\n管理员密码：%s\n' "$PANEL_USER" "$PANEL_PASS"
         printf '证书文件：%s\n私钥文件：%s\n' "$CERT_FILE" "$KEY_FILE"
         printf '\n[节点与导入链接]\n'
@@ -1001,9 +1071,9 @@ write_node_files() {
         printf 'OpenRC 系统使用 rc-service x-ui status。面板进程存在时仍需核对节点端口是否由 Xray 监听。\n'
         printf '带宽换算：1000Mbps 理论约 125MB/s；1TB 是流量额度。\n'
         printf '\n[保管文件]\n%s\n%s\n%s\n' "$profiles_file" "$links_file" "$info_file"
-    } >"$RUN_DIR/info.txt"
-    install -m 600 "$RUN_DIR/info.txt" "$info_file"
-    install -m 600 "$RUN_DIR/info.txt" "$legacy_file"
+    } >"$RUN_DIR/info.txt" || return 1
+    install -m 600 "$RUN_DIR/info.txt" "$info_file" || return 1
+    install -m 600 "$RUN_DIR/info.txt" "$legacy_file" || return 1
 }
 
 print_summary() {
@@ -1011,8 +1081,182 @@ print_summary() {
     cat "$XUI_INFO_DIR/3x-ui-nodes-info.txt"
 }
 
+# 14. 向已有面板增添长期节点，保留原入站、证书与管理员账户。
+existing_panel_setting() {
+    local key="$1"
+    case "$key" in webPort|webBasePath|webListen|webCertFile|webKeyFile) ;;
+        *) fail "不支持读取该面板设置。"; return 1 ;; esac
+    sqlite3 -readonly "$XUI_DB_PATH" "SELECT value FROM settings WHERE key='$key' LIMIT 1;"
+}
+
+existing_node_port_available() {
+    local transport="$1" port="$2" count listener
+    if [[ "$transport" == udp ]]; then
+        count=$(sqlite3 -readonly "$XUI_DB_PATH" "SELECT count(*) FROM inbounds WHERE port=$port AND protocol IN ('hysteria','wireguard','tuic');") || return 1
+        listener=$(ss -H -lnu "sport = :${port}") || return 1
+    else
+        count=$(sqlite3 -readonly "$XUI_DB_PATH" "SELECT count(*) FROM inbounds WHERE port=$port AND protocol NOT IN ('hysteria','wireguard','tuic');") || return 1
+        listener=$(ss -H -lnt "sport = :${port}") || return 1
+        [[ "$port" != "$PANEL_PORT" && "$port" != 80 ]] || return 1
+        [[ "${EXISTING_SELECTED_TCP:-|}" != *"|${port}|"* ]] || return 1
+    fi
+    [[ "$count" == 0 && -z "$listener" ]]
+}
+
+existing_select_node_port() {
+    local name="$1" default_port="$2" transport="$3" selected attempt
+    selected="${!name:-}"
+    if [[ -n "$selected" ]]; then
+        valid_port "$selected" || { fail "${name} 必须是 1–65535 的端口。"; return 1; }
+        selected=$((10#$selected))
+        existing_node_port_available "$transport" "$selected" || {
+            fail "指定端口 ${name}=${selected}/${transport} 已占用或与已有入站冲突，请换一个端口。"; return 1;
+        }
+    else
+        selected="$default_port"
+        for attempt in {1..100}; do
+            if existing_node_port_available "$transport" "$selected"; then break; fi
+            selected=$((selected + 1))
+        done
+        ((attempt <= 100 && selected <= 65535)) && existing_node_port_available "$transport" "$selected" || {
+            fail "未找到 ${name} 可用端口，请通过环境变量指定。"; return 1;
+        }
+    fi
+    printf -v "$name" '%s' "$selected"
+    if [[ "$transport" == tcp ]]; then EXISTING_SELECTED_TCP+="${selected}|"; fi
+}
+
+load_existing_panel_context() {
+    local runtime="${XUI_INSTALL_DIR}/bin/config.json" cert_profile panel_listen old_info
+    [[ -s "$runtime" ]] || { fail "未找到现有 Xray 配置，先在面板中启动原节点后重试。"; return 1; }
+    PANEL_PORT=$(existing_panel_setting webPort)
+    valid_port "$PANEL_PORT" || { fail "无法读取现有面板端口 webPort。"; return 1; }
+    WEB_BASE_PATH=$(existing_panel_setting webBasePath)
+    WEB_BASE_PATH="${WEB_BASE_PATH#/}"; WEB_BASE_PATH="${WEB_BASE_PATH%/}"
+    [[ -z "$WEB_BASE_PATH" || "$WEB_BASE_PATH" =~ ^[A-Za-z0-9_-]+$ ]] || {
+        fail "现有面板路径格式暂不支持，请在面板中使用字母、数字、下划线或短横线。"; return 1;
+    }
+    panel_listen=$(existing_panel_setting webListen)
+    case "$panel_listen" in ''|0.0.0.0|::|'[::]') PANEL_API_HOST=127.0.0.1 ;;
+        *) PANEL_API_HOST="$panel_listen" ;; esac
+    if [[ -n "$(existing_panel_setting webCertFile)" && -n "$(existing_panel_setting webKeyFile)" ]]; then
+        PANEL_API_SCHEME=https
+    else
+        PANEL_API_SCHEME=http
+    fi
+    cert_profile=$(jq -cer '
+        [.inbounds[] | select(.streamSettings.security == "tls") |
+         select(any(.streamSettings.tlsSettings.certificates[]?;
+                    (.certificateFile // "") != "" and (.keyFile // "") != ""))] |
+        sort_by(if .port == 443 then 0 else 1 end) | .[0] // empty
+    ' "$runtime") || { fail "原节点没有可复用的 TLS 证书，请先在面板配置有效证书。"; return 1; }
+    CERT_FILE=$(jq -er '.streamSettings.tlsSettings.certificates[] | select(.certificateFile and .keyFile) | .certificateFile' <<<"$cert_profile" | head -n 1)
+    KEY_FILE=$(jq -er '.streamSettings.tlsSettings.certificates[] | select(.certificateFile and .keyFile) | .keyFile' <<<"$cert_profile" | head -n 1)
+    CERT_HOST="${XUI_DOMAIN:-$(jq -r '.streamSettings.tlsSettings.serverName // ""' <<<"$cert_profile")}"
+    CERT_HOST="${CERT_HOST:-$SERVER_IP}"
+    validate_certificate_pair "$CERT_HOST" "$CERT_FILE" "$KEY_FILE" || {
+        fail "现有 TLS 证书校验失败；请先核对证书与私钥，域名不匹配时用 XUI_DOMAIN 指定证书覆盖的域名后重试。"
+        return 1
+    }
+    CERT_DIR="${CERT_FILE%/*}"
+    PANEL_USER="${XUI_USERNAME:-}"
+    PANEL_PASS="${XUI_PASSWORD:-}"
+    PANEL_CREDENTIALS_AVAILABLE=0
+    for old_info in "$XUI_INFO_DIR/3x-ui-nodes-info.txt" "$XUI_INFO_DIR/3x-ui-xhttp-info.txt"; do
+        [[ -f "$old_info" ]] || continue
+        if [[ -z "$PANEL_USER" ]]; then PANEL_USER=$(sed -nE 's/^[[:space:]]*管理员账号[：:][[:space:]]*//p' "$old_info" | head -n 1); fi
+        if [[ -z "$PANEL_PASS" ]]; then PANEL_PASS=$(sed -nE 's/^[[:space:]]*管理员密码[：:][[:space:]]*//p' "$old_info" | head -n 1); fi
+    done
+    if [[ -n "$PANEL_USER" && -n "$PANEL_PASS" && "$PANEL_PASS" != '沿用原密码（未修改）' ]]; then
+        PANEL_CREDENTIALS_AVAILABLE=1
+    fi
+    PANEL_USER="${PANEL_USER:-沿用原面板账号}"
+    PANEL_PASS="${PANEL_PASS:-沿用原密码（未修改）}"
+    EXISTING_DEPLOYMENT=1
+}
+
+add_nodes_to_existing() {
+    [[ -f "$XUI_DB_PATH" ]] || { fail "未检测到已有 3x-ui，请使用无参数的新装命令。"; return 1; }
+    install_deps || return 1
+    detect_server_ip || return 1
+    install -d -m 700 "$XUI_INFO_DIR" || return 1
+    resolve_xray_binary || return 1
+    load_existing_panel_context || return 1
+    local profiles_file="$XUI_INFO_DIR/3x-ui-node-profiles.json" tag count primary_answer name
+    if [[ -s "$profiles_file" ]]; then
+        jq -e 'type == "array" and length == 4 and ([.[].key] | sort) == ["hy2","raw","reality","xhttp"]' \
+            "$profiles_file" >/dev/null || { fail "已有节点资料文件不完整，请先核对 $profiles_file；没有新建节点。"; return 1; }
+        NODE_PROFILES=$(jq -c '.' "$profiles_file") || return 1
+        while IFS= read -r tag; do
+            [[ "$tag" =~ ^[A-Za-z0-9_-]+$ ]] || { fail "已有节点标签格式无效。"; return 1; }
+            count=$(sqlite3 -readonly "$XUI_DB_PATH" "SELECT count(*) FROM inbounds WHERE tag='$tag';") || return 1
+            [[ "$count" == 1 ]] || { fail "已有节点资料与面板不一致，请在面板核对 $tag；没有重复创建。"; return 1; }
+        done < <(jq -r '.[].payload.tag' "$profiles_file")
+        printf '%s\n' "$NODE_PROFILES" >"$RUN_DIR/profiles.json" || return 1
+        verify_running_nodes || return 1
+        log_info "四种长期节点已经存在且正在监听，本次直接显示已有导入信息。"
+        print_summary || return 1
+        return 0
+    fi
+
+    PRIMARY_NODE="${PRIMARY_NODE:-hy2}"
+    case "$PRIMARY_NODE" in hy2|raw|reality|xhttp) ;; *) fail "PRIMARY_NODE 只能是 hy2、raw、reality 或 xhttp。"; return 1 ;; esac
+    if [[ "${AUTO_YES:-0}" != 1 ]]; then
+        printf '将保留全部原入站，并新增四种长期节点。请选择主用：\n1) Hy2（默认）  2) RAW TCP  3) REALITY  4) XHTTP\n'
+        primary_answer=''
+        prompt_read "主用选择 [回车保留 ${PRIMARY_NODE}]: " primary_answer
+        case "$primary_answer" in
+            1|hy2) PRIMARY_NODE=hy2 ;; 2|raw) PRIMARY_NODE=raw ;;
+            3|reality) PRIMARY_NODE=reality ;; 4|xhttp) PRIMARY_NODE=xhttp ;;
+            '') ;; *) fail "主用选择无效，请输入 1–4。"; return 1 ;;
+        esac
+    fi
+    EXISTING_SELECTED_TCP='|'
+    existing_select_node_port RAW_PORT 24445 tcp || return 1
+    existing_select_node_port REALITY_PORT 24443 tcp || return 1
+    existing_select_node_port HY2_PORT 24444 udp || return 1
+    existing_select_node_port XHTTP_PORT 8443 tcp || return 1
+    REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-www.microsoft.com}"
+    REALITY_TARGET="${REALITY_TARGET:-${REALITY_SERVER_NAME}:443}"
+    valid_domain "$REALITY_SERVER_NAME" || { fail "REALITY_SERVER_NAME 无效。"; return 1; }
+    XHTTP_PATH="${XHTTP_PATH:-/$(gen_random_str 10)}"
+    [[ "$XHTTP_PATH" == /* ]] || XHTTP_PATH="/${XHTTP_PATH}"
+    INBOUND_TLS_MODE=1
+    VLESS_ENC_TYPE="${VLESS_ENC_TYPE:-1}"
+    case "$VLESS_ENC_TYPE" in 1|2) ;; *) fail "VLESS_ENC_TYPE 只能是 1 或 2。"; return 1 ;; esac
+    verify_reality_target || return 1
+    local backup
+    backup="$XUI_INFO_DIR/3x-ui-before-add-nodes-$(date -u +%Y%m%dT%H%M%SZ)-$$.db"
+    sqlite3 "$XUI_DB_PATH" ".backup '$backup'" || return 1
+    chmod 600 "$backup" || return 1
+    log_info "已备份数据库：$backup；原入站保持保留。"
+    EXISTING_INFO_BACKUP="${backup%.db}-info"
+    install -d -m 700 "$EXISTING_INFO_BACKUP" || return 1
+    for name in 3x-ui-node-profiles.json 3x-ui-nodes-info.txt 3x-ui-node-links.txt 3x-ui-xhttp-info.txt; do
+        if [[ -f "$XUI_INFO_DIR/$name" ]]; then
+            cp "$XUI_INFO_DIR/$name" "$EXISTING_INFO_BACKUP/$name" || return 1
+        else
+            : >"$EXISTING_INFO_BACKUP/$name.absent" || return 1
+        fi
+    done
+    generate_vlessenc_keys || return 1
+    generate_reality_keys || return 1
+    prepare_node_profiles || return 1
+    api_init || return 1
+    create_inbound_nodes || return 1
+    write_node_files || return 1
+    ROLLBACK_NEEDED=0
+    log_info "长期节点已添加到现有面板；原入站继续保留。数据库备份：$backup；旧连接信息：$EXISTING_INFO_BACKUP"
+    print_summary
+}
+
+
 main() {
     init_platform
+    if [[ "${1:-}" == "--add-nodes" ]]; then
+        add_nodes_to_existing
+        return 0
+    fi
     if [[ "${1:-}" == "--switch-domain" ]]; then
         switch_existing_to_domain "${2:-}"
         return 0
@@ -1022,7 +1266,7 @@ main() {
     detect_server_ip
     init_config
     if [[ -e "$XUI_DB_PATH" ]]; then
-        fail "检测到已有 3x-ui 数据库。请先备份并使用已有面板；域名迁移可运行 --switch-domain。"
+        fail "检测到已有 3x-ui 数据库。添加长期节点请运行 --add-nodes；域名迁移使用 --switch-domain。"
         return 1
     fi
     check_ports_available
