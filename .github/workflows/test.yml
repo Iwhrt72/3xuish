@@ -1,0 +1,21 @@
+name: Installer checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shell-and-fixtures:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test tools
+        run: sudo apt-get update -qq && sudo apt-get install -y jq sqlite3 shellcheck
+      - name: Check both installation entry points
+        run: |
+          bash -n install.sh
+          bash -n install_3xui_xhttp_vlessenc.sh
+          shellcheck -S warning install.sh install_3xui_xhttp_vlessenc.sh
+          cmp install.sh install_3xui_xhttp_vlessenc.sh
+      - name: Test profiles and installation transactions
+        run: python3 -m unittest discover -s tests -v
