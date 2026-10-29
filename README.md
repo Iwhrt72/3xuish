@@ -49,6 +49,8 @@ bash /tmp/3xuish-install.sh
 
 旧入口 `install_3xui_xhttp_vlessenc.sh` 仍可使用，功能与 `install.sh` 保持一致。
 
+REALITY 新部署默认目标为 `www.apple.com:443`，客户端 SNI 同步使用 `www.apple.com`；可用 `REALITY_SERVER_NAME`、`REALITY_TARGET` 自定义。目标预检覆盖 TLS 1.3、X25519、证书名称和 h2，但不代表手机端兼容测试通过。新版不会自动改动已有节点；微软目标的历史记录长度问题、版本边界及已有节点处理方法见 [REALITY 兼容说明](docs/reality-compatibility.md)。
+
 已有自动化参数继续可用。`AUTO_YES=1` 无参数运行仍走无人值守新装；也可显式指定操作：
 
 ```bash
