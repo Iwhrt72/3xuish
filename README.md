@@ -143,6 +143,35 @@ bash /tmp/3xuish-install.sh --repair-performance --inbound-id 1
 
 已经没有旧值的节点会跳过，不重复重启。`--add-nodes` 仍只用于新增方案，不代替原位修复。此功能修正旧配置，实际吞吐量仍取决于当前网络和传输方案；`tcpWindowClamp` 主要影响服务端接收方向，不能把全部下载慢都归因于它。
 
+## 服务器测速，不重装
+
+在服务器 root 终端执行这条独立诊断命令：
+
+```bash
+curl -q -fLso /tmp/3xuish-speed-test.sh https://raw.githubusercontent.com/Iwhrt72/3xuish/main/scripts/server-speed-test.sh &&
+bash /tmp/3xuish-speed-test.sh
+```
+
+需要 Bash、Python 3.8+、curl、sha256sum，以及面板现有的 Xray 内核；缺少 SNI 时，使用 OpenSSL 从现有公开证书的 SAN 中读取具体名称。脚本不安装软件、不修改节点或订阅、不重启面板。它会读取数据库与运行配置，使用有效的现有认证在回环地址启动临时客户端，结束或按 Ctrl+C 后关闭自己的客户端并清理临时认证文件。
+
+每条路径依次测 OVH 单连接、OVH 四连接和 Cloudflare 单连接，每组默认最多 10 秒。首先测试服务器直接下载，再测试最多四个已启用的 VLESS TCP/RAW/XHTTP/REALITY 或 Hy2 入站。现有 XHTTP/443 和 Hy2/42710 会分别显示为对应入站 ID 的测试路径；不识别的节点或缺失参数会显示跳过原因。TLS 继续验证证书，不能验证的测试不会自动改成跳过证书检查。
+
+默认测两个节点时，采样约 90 秒以内，加上初始化可能需要 1–2 分钟，下载有效载荷最多约 1.8 GiB。测试流量会计入服务器流量和所测节点用量；没有下载大文件到磁盘。HTTP 错误页、认证失败、传输失败不计为有效速度；有效的限时样本会保留已下载字节和退出码。四连接速度按整个组的实际用时计算。
+
+结果表使用 Mbps，`direct` 是服务器直接下载，`inbound-1-xhttp` 等是通过现有入站的本机回环下载。**回环测试排除了用户电脑到服务器的公网链路，不能证明客户端实际速度或公网节点可达性；本脚本也不测上传速度。** 相同下载源的直接下载和回环结果可以帮助判断节点自身是否有明显处理瓶颈；不同源、不同测试时间的差异还可能来自线路变化。
+
+完整脱敏报告保存在 `/root/3xuish-speed-test/<时间与随机编号>/report.json`，不含 UUID、认证、私钥、节点域名或原始日志，目录仅 root 可读。`complete` 表示本次选定测试都有有效结果，`partial` 表示部分源失败、部分节点跳过或超过四个节点未全部测完，`failed` 表示没有有效速度；失败项不能当作 `0 Mbps` 判断节点慢。
+
+需要缩短采样、只测基础下载或指定入站时：
+
+```bash
+bash /tmp/3xuish-speed-test.sh --seconds 5
+bash /tmp/3xuish-speed-test.sh --direct-only
+bash /tmp/3xuish-speed-test.sh --inbound-id 1 --inbound-id 4
+```
+
+下载源依据 [OVH 官方测速说明](https://proof.ovh.net/) 和 [Cloudflare 官方 speedtest API](https://github.com/cloudflare/speedtest)；单次结果不代表服务器套餐或所有目的地的带宽上限。
+
 ## 给已有面板添加节点
 
 此前的速度对照使用临时入口，结束后恢复原 XHTTP 并停止 REALITY、Hy2。需要长期使用时，在原服务器 root 终端执行：
