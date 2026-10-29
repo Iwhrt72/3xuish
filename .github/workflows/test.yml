@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        check: [panel_smoke, existing_panel_smoke, runtime_smoke]
+        check: [panel_smoke, existing_panel_smoke, performance_panel_smoke, runtime_smoke]
     steps:
       - uses: actions/checkout@v4
       - name: Validate against 3x-ui v3.11.0 and its bundled Xray
