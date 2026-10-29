@@ -206,6 +206,135 @@ class PerformanceRepair(unittest.TestCase):
         self.assertEqual(self.manifest_path.read_bytes(), self.before_manifest)
         self.assertFalse(self.job.exists())
 
+    def test_scan_reports_selected_and_skipped_nodes_without_credentials(self):
+        result = repair.summarize(repair.make_plan(self.database, self.manifest_path))
+        self.assertEqual(result["counts"], {"total": 5, "selected": 4, "repair": 3})
+        self.assertEqual(result["reason"], "legacy_values_found")
+        scanned = {node["id"]: node for node in result["checked_nodes"]}
+        self.assertEqual(set(scanned), set(self.before_rows))
+        self.assertTrue(scanned[1]["selected"])
+        self.assertEqual(scanned[1]["reason"], "legacy_installer")
+        self.assertEqual(scanned[3]["reason"], "managed_profile")
+        self.assertTrue(scanned[4]["selected"])
+        self.assertEqual(scanned[4]["legacy_fields"], [])
+        self.assertFalse(scanned[2]["selected"])
+        self.assertEqual(scanned[2]["reason"], "unrecognized_inbound")
+        self.assertEqual(set(scanned[2]["legacy_fields"]), set(repair.FIELDS))
+        for node in scanned.values():
+            self.assertLessEqual(set(node), {"id", "port", "enabled", "protocol", "network", "security",
+                                             "selected", "reason", "legacy_fields"})
+        output = json.dumps(result)
+        for secret in ("keep-subscription-", "fixture-credential-preserved", "fixture-admin",
+                       "unchanged-password-hash", "keep-this-path", "00000000-0000-4000"):
+            self.assertNotIn(secret, output)
+        self.assertEqual(self.database.read_bytes(), self.before_db)
+
+    def test_no_recognized_nodes_reports_legacy_candidates_instead_of_empty_result(self):
+        self.manifest_path.unlink()
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("UPDATE inbounds SET remark='renamed user node'")
+            connection.commit()
+        before = self.database.read_bytes()
+        result = repair.summarize(repair.make_plan(self.database, self.manifest_path))
+        self.assertEqual(result["counts"], {"total": 5, "selected": 0, "repair": 0})
+        self.assertEqual(result["reason"], "no_recognized_nodes")
+        self.assertEqual(len(result["checked_nodes"]), 5)
+        self.assertTrue(any(node["legacy_fields"] for node in result["checked_nodes"]))
+        self.assertTrue(all(not node["selected"] for node in result["checked_nodes"]))
+        self.assertTrue(result["review_required"])
+        self.assertFalse(result["scope_complete"])
+        self.assertEqual(set(result["unselected_legacy_nodes"]), {1, 2, 3, 5})
+        self.assertEqual(self.database.read_bytes(), before)
+        self.assertEqual(self.adapter.restart_count, 0)
+
+    def test_unrelated_malformed_stream_is_reported_without_blocking_known_nodes(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("UPDATE inbounds SET stream_settings='invalid json' WHERE id=2")
+            connection.commit()
+        plan = repair.make_plan(self.database, self.manifest_path)
+        self.assertEqual({row["id"] for row in plan["rows"]}, {1, 3, 5})
+        node = next(node for node in repair.summarize(plan)["checked_nodes"] if node["id"] == 2)
+        self.assertFalse(node["selected"])
+        self.assertEqual(node["reason"], "invalid_stream_json")
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("UPDATE inbounds SET stream_settings='invalid json' WHERE id=1")
+            connection.commit()
+        with self.assertRaisesRegex(repair.RepairError, "invalid_stream_json"):
+            repair.make_plan(self.database, self.manifest_path)
+
+    def test_malformed_unrelated_transport_does_not_block_valid_node_repair(self):
+        for network in ([], {}):
+            with self.subTest(network=network):
+                self.update_stream(2, lambda value: value.update(network=network))
+                plan = repair.make_plan(self.database, self.manifest_path)
+                self.assertEqual({row["id"] for row in plan["rows"]}, {1, 3, 5})
+                scanned = {node["id"]: node for node in repair.summarize(plan)["checked_nodes"]}
+                self.assertFalse(scanned[2]["selected"])
+                self.assertEqual(scanned[2]["network"], "unknown")
+                self.assertEqual(scanned[2]["reason"], "unsupported_transport")
+
+    def test_explicit_scope_does_not_require_review_of_unrelated_corrupt_rows(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("UPDATE inbounds SET stream_settings='invalid json' WHERE id=2")
+            connection.commit()
+        result = repair.summarize(repair.make_plan(self.database, self.manifest_path, inbound_id=4))
+        self.assertEqual(result['counts']['selected'], 1)
+        self.assertEqual(result['counts']['repair'], 0)
+        self.assertFalse(result['review_required'], result)
+        self.assertTrue(result['scope_complete'], result)
+        self.assertEqual(result['reason'], 'selected_nodes_clean')
+
+    def test_renamed_single_inbound_is_repaired_automatically_and_keeps_custom_values(self):
+        self.manifest_path.unlink()
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("DELETE FROM inbounds WHERE id<>1")
+            connection.execute("UPDATE inbounds SET remark='renamed sole node' WHERE id=1")
+            connection.commit()
+        self.update_stream(1, lambda value: value.update(security="none", sockopt={
+            **OLD, "tcpWindowClamp": 12000}))
+        self.regenerate_runtime()
+        before = self.rows()[1]
+        plan = repair.make_plan(self.database, self.manifest_path)
+        node = repair.summarize(plan)["checked_nodes"][0]
+        self.assertTrue(node["selected"])
+        self.assertEqual(node["reason"], "single_inbound")
+        result = self.execute()
+        self.assertEqual(result["status"], "complete", result)
+        after = self.rows()[1]
+        expected_stream = json.loads(before["stream_settings"])
+        expected_stream["sockopt"] = {**FIXED, "tcpWindowClamp": 12000}
+        self.assertEqual(json.loads(after["stream_settings"]), expected_stream)
+        self.assertEqual({key: value for key, value in after.items() if key != "stream_settings"},
+                         {key: value for key, value in before.items() if key != "stream_settings"})
+        self.assertEqual(set(self.rows()), {1})
+        self.assertEqual(self.links.read_bytes(), b"preserve-exact-import-links\n")
+        self.assertEqual(self.adapter.restart_count, 1)
+
+    def test_repair_cli_waits_for_terminal_result_instead_of_only_reporting_start(self):
+        launched = {"status": "started", "job_directory": str(self.job)}
+        completed = {"status": "complete", "nodes": [{"id": 1}]}
+        args = ["repair", "--database", str(self.database), "--install-dir", str(self.install_dir),
+                "--info-dir", str(self.info), "--xray", __file__]
+        with mock.patch.object(repair, "launch_repair", return_value=launched), \
+                mock.patch.object(repair, "wait_for_completion", return_value=completed) as wait, \
+                mock.patch("builtins.print") as printed:
+            code = repair.main(args)
+        self.assertEqual(code, 0)
+        wait.assert_called_once()
+        self.assertEqual(wait.call_args.args[1], launched)
+        self.assertIn('"complete"', printed.call_args.args[0])
+
+    def test_cli_does_not_report_success_when_unselected_legacy_values_remain(self):
+        result = {"status": "no_changes", "nodes": [], "review_required": True,
+                  "reason": "no_recognized_nodes"}
+        args = ["repair", "--database", str(self.database), "--install-dir", str(self.install_dir),
+                "--info-dir", str(self.info), "--xray", __file__]
+        with mock.patch.object(repair, "launch_repair", return_value=result), \
+                mock.patch.object(repair, "wait_for_completion", return_value=result), \
+                mock.patch("builtins.print"):
+            code = repair.main(args)
+        self.assertNotEqual(code, 0)
+
     def test_repair_keeps_all_identity_fields_and_links_then_is_idempotent(self):
         result = self.execute()
         self.assertIn(result["status"], SUCCESS, result)
@@ -455,15 +584,22 @@ json.loads(path.read_text())
         self.addCleanup(self.release.touch)
         self.assertEqual(launched['status'],'started',launched)
         download.unlink()
-        self.assertEqual(helper.launch_repair(self.config)['status'],'busy')
+        busy = helper.launch_repair(self.config)
+        self.assertEqual(busy['status'],'busy')
+        self.assertEqual(busy['job_directory'], launched['job_directory'])
+        different_scope = helper.launch_repair(dict(self.config, inbound_id=2))
+        self.assertEqual(different_scope['status'], 'busy')
+        self.assertNotIn('job_directory', different_scope)
+        self.assertNotIn('backup_directory', different_scope)
+        with mock.patch.object(helper, 'read_job', side_effect=AssertionError('must not follow another scope')):
+            self.assertEqual(helper.wait_for_completion(self.config, different_scope), different_scope)
+        timed_out = helper.wait_for_completion(self.config, busy, timeout=.01, interval=.005)
+        self.assertIn(timed_out['status'], {'starting', 'running'})
+        self.assertTrue(timed_out['wait_timed_out'])
         state=helper.read_latest(self.config)
         self.assertIn(state['status'],{'starting','running'})
         self.release.touch()
-        deadline=time.monotonic()+15
-        while time.monotonic()<deadline:
-            state=helper.read_latest(self.config)
-            if state['status'] not in {'starting','running'}: break
-            time.sleep(.05)
+        state = helper.wait_for_completion(self.config, launched, timeout=15, interval=.05)
         self.assertEqual(state['status'],'complete',state)
         self.fixture.assert_preserved_except_tuning()
         self.assertEqual(helper.launch_repair(self.config)['status'],'no_changes')
@@ -471,6 +607,61 @@ json.loads(path.read_text())
         self.assertTrue((job/'worker.py').is_file())
         self.assertTrue((job/'x-ui-before.db').is_file())
         self.assertEqual(processes[0].wait(timeout=5),0)
+
+    def test_noop_is_saved_and_status_reports_the_same_scan_without_a_worker(self):
+        self.fixture.execute()
+        self.fixture.update_stream(2, lambda value: value.update(sockopt=FIXED))
+        before = self.fixture.database.read_bytes()
+        with mock.patch.object(repair.subprocess, "Popen") as process, \
+                mock.patch.object(repair, "DefaultAdapter") as adapter:
+            result = repair.launch_repair(self.config)
+        process.assert_not_called()
+        adapter.assert_not_called()
+        self.assertEqual(result['status'], 'no_changes', result)
+        self.assertEqual(result['reason'], 'selected_nodes_clean')
+        self.assertEqual(result['counts'], {'total': 5, 'selected': 4, 'repair': 0})
+        self.assertFalse(result['review_required'])
+        saved = repair.read_latest(self.config)
+        self.assertEqual(saved['status'], 'no_changes')
+        self.assertEqual(saved['checked_nodes'], result['checked_nodes'])
+        self.assertEqual(saved['job_directory'], result['job_directory'])
+        job = Path(result['job_directory'])
+        self.assertTrue((job / 'state.json').is_file())
+        self.assertFalse((job / 'worker.py').exists())
+        self.assertFalse((job / 'x-ui-before.db').exists())
+        self.assertEqual(self.fixture.database.read_bytes(), before)
+
+    def test_wait_follows_its_job_when_a_newer_result_replaces_latest(self):
+        root = self.fixture.info / repair.ROOT_NAME
+        own = root / 'job-20261029T010203Z-123456abcdef'
+        newer = root / 'job-20261029T010204Z-abcdef123456'
+        own.mkdir(parents=True)
+        newer.mkdir()
+        repair.write_state(own, 'complete', nodes=[{'id': 1}])
+        repair.write_state(newer, 'no_changes', nodes=[{'id': 2}])
+        repair.atomic_json(root / 'latest.json', {'job': newer.name})
+        launched = {'status': 'started', 'job_directory': str(own), 'backup_directory': str(own)}
+        result = repair.wait_for_completion(self.config, launched, timeout=.1, interval=.01)
+        self.assertEqual(result['status'], 'complete', result)
+        self.assertEqual(result['nodes'], [{'id': 1}])
+        terminal = {'status': 'no_changes', 'nodes': [], 'reason': 'selected_nodes_clean'}
+        with mock.patch.object(repair, 'read_latest', side_effect=AssertionError('must not poll latest')):
+            self.assertEqual(repair.wait_for_completion(self.config, terminal), terminal)
+
+    def test_busy_launcher_does_not_follow_previous_terminal_job_before_new_pointer(self):
+        import fcntl
+        root = self.fixture.info / repair.ROOT_NAME
+        previous = root / 'job-20261029T010203Z-123456abcdef'
+        previous.mkdir(parents=True)
+        repair.write_state(previous, 'no_changes', nodes=[])
+        repair.atomic_json(root / 'latest.json', {'job': previous.name})
+        with (root / 'repair.lock').open('w') as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = repair.launch_repair(self.config)
+            self.assertEqual(result['status'], 'busy')
+            self.assertNotIn('job_directory', result)
+            self.assertNotIn('backup_directory', result)
+            self.assertEqual(repair.wait_for_completion(self.config, result), result)
 
     def test_orphaned_status_is_read_only_and_cannot_launch_another_repair(self):
         root=self.fixture.info/repair.ROOT_NAME

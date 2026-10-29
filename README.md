@@ -96,22 +96,21 @@ AUTO_YES=1 CERT_MODE=2 XUI_DOMAIN=example.com PRIMARY_NODE=hy2 bash /tmp/3xuish-
 
 ## 修复旧节点，保留原链接
 
-更新脚本文件不会自动修改面板数据库。老用户希望继续使用原节点、端口和订阅链接时，不需要卸载重装，也不必新增节点；先在服务器 root 终端检查：
+老用户保留原节点、端口和订阅链接，一条命令检查并原位修复。在服务器 root 终端执行：
 
 ```bash
 curl -fLso /tmp/3xuish-install.sh https://raw.githubusercontent.com/Iwhrt72/3xuish/main/install.sh &&
-bash /tmp/3xuish-install.sh --check-performance
+bash /tmp/3xuish-install.sh --repair-performance
 ```
 
-检查只读取已有配置，输出入站 ID、端口和命中的旧参数，不输出 UUID、密码或私钥。默认识别旧脚本的 `VLESS-XHTTP-Enc-Vision` TLS/XHTTP 入站，以及本脚本已保存资料明确登记的 VLESS 节点。此模式不会安装或升级面板。
+脚本自动检查入站并显示选中原因、旧参数及检查数量，不输出 UUID、密码或私钥。只有一个入站且为支持的 VLESS TCP/RAW/XHTTP 传输时，自动选中它，不要求保留原备注，也不要求先安装四节点。多个入站时，默认识别旧脚本的 `VLESS-XHTTP-Enc-Vision` TLS/XHTTP 入站，以及本脚本已保存资料明确登记的 VLESS 节点。此模式不会安装或升级面板。
 
 服务器的 `python3` 命令需要 Python **3.8 或更新版本**，可用 `python3 --version` 确认。Debian/Ubuntu 可执行 `apt-get install -y python3`，Alpine 执行 `apk add python3`；旧版系统安装后仍须核对版本。版本不足时，脚本会在下载修复组件或修改节点之前停止。
 
-执行原位修复，再查询结果：
+只想预览、不修改配置时：
 
 ```bash
-bash /tmp/3xuish-install.sh --repair-performance
-bash /tmp/3xuish-install.sh --repair-performance-status
+bash /tmp/3xuish-install.sh --check-performance
 ```
 
 | 旧脚本保存的值 | 修复后的行为 |
@@ -123,11 +122,19 @@ bash /tmp/3xuish-install.sh --repair-performance-status
 
 只修改表中精确匹配的旧值，其他自定义值保留。系统全局 BBR、缓冲区和防火墙不会被修改。域名、端口、UUID、VLESS Encryption/REALITY 密钥、XHTTP 路径和订阅链接保持原值；修复生效后客户端断开重连即可。
 
-任务会备份数据库和相关文件，先验证候选 Xray 配置，再更新数据库、重启面板并核对实际生成配置及原监听。它独立于 SSH 会话运行，重启导致管理连接断开后仍会继续。`started` 表示已启动，必须以状态查询的 `complete` 为成功依据；`no_changes` 表示没有命中需要修改的旧值。
+任务会备份数据库和相关文件，先验证候选 Xray 配置，再更新数据库、重启面板并核对实际生成配置及原监听。命令会自动等待最多 60 秒并显示最终结果：`complete` 表示完成，`no_changes` 会同时说明哪些入站已经检查、为何没有修改。未选中的入站仍有旧参数或无法完整检查时，输出 `review_required: true`，不会把它当作整台服务器都已检查干净。修复命令检查后发现无需修改时，也会保存本次检查记录；`--check-performance` 预览仍然只读。
+
+任务独立于 SSH 会话运行，重启导致管理连接断开后仍会继续。等待超过 60 秒或连接中断时，重新连接后查询：
+
+```bash
+bash /tmp/3xuish-install.sh --repair-performance-status
+```
+
+`started`、`starting` 或 `running` 表示尚未确认完成，必须以最终 `complete` 为成功依据。
 
 任务记录和备份位于服务器 `/root/3xuish-performance-repair/` 下的独立目录，仅 root 可读。普通失败会尝试精确回滚本次修改；`rolled_back` 表示修复失败并恢复，`manual_recovery_required` 表示检测到并发修改、后台任务异常中断或恢复异常，应保留该目录检查，不能盲目覆盖整个数据库。异常中断不会一直显示“运行中”，再次修复也会停止并保留上次记录，待核验恢复后处理。
 
-如果旧节点被改名，自动识别没有选中，可在面板确认入站 ID 后显式指定，例如 ID 为 1：
+多个入站中存在无法自动确定归属的旧参数时，检查结果会列出未选中的入站 ID。核对目标后可以显式指定，例如 ID 为 1：
 
 ```bash
 bash /tmp/3xuish-install.sh --check-performance --inbound-id 1
