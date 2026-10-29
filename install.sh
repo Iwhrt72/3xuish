@@ -11,6 +11,7 @@ set -euo pipefail
 umask 077
 
 REPO_RAW_URL="https://raw.githubusercontent.com/Iwhrt72/3xuish/main/install.sh"
+INSTALLER_SOURCE_FILE="${BASH_SOURCE[0]:-}"
 XUI_INSTALL_DIR="${XUI_INSTALL_DIR:-/usr/local/x-ui}"
 XUI_DB_PATH="${XUI_DB_PATH:-/etc/x-ui/x-ui.db}"
 XUI_INFO_DIR="${XUI_INFO_DIR:-/root}"
@@ -25,6 +26,7 @@ ATTEMPTED_TAGS=()
 ROLLBACK_NEEDED=0
 NODE_PROFILES='[]'
 PERFORMANCE_HELPER_SHA256="f2bb9385286065ad700754143de8ce5b8541721f583a1a218c8a697bc2a5ed44"
+SPEED_TEST_SHA256="ad35625188532e12869684997eb919f928aa9b876e3742e3dff6a277e8a2ec0b"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -1308,29 +1310,41 @@ performance_command() {
     python3 "$helper" "${args[@]}"
 }
 
-main() {
-    init_platform
-    case "${1:-}" in
-        --check-performance) performance_command check "${@:2}"; return $? ;;
-        --repair-performance) performance_command repair "${@:2}"; return $? ;;
-        --repair-performance-status) performance_command status "${@:2}"; return $? ;;
-    esac
-    if [[ "${1:-}" == "--add-nodes" ]]; then
-        add_nodes_to_existing
-        return 0
+speed_test_command() {
+    local helper="$RUN_DIR/server-speed-test.sh" source_dir bundled actual name
+    command -v sha256sum >/dev/null 2>&1 || { fail "未找到 sha256sum。"; return 1; }
+    source_dir="$(cd -- "$(dirname -- "$INSTALLER_SOURCE_FILE")" && pwd)"
+    bundled="$source_dir/scripts/server-speed-test.sh"
+    if [[ -f "$bundled" ]]; then
+        cp -- "$bundled" "$helper" || return 1
+        for name in server_speed_probe.py server_speed_test.py; do
+            if [[ -f "$source_dir/scripts/$name" ]]; then
+                cp -- "$source_dir/scripts/$name" "$RUN_DIR/$name" || return 1
+            fi
+        done
+    else
+        command -v curl >/dev/null 2>&1 || { fail "测速需要 curl；请先安装 curl。"; return 1; }
+        curl -q -fLsS --connect-timeout 10 --max-time 60 \
+            https://raw.githubusercontent.com/Iwhrt72/3xuish/main/scripts/server-speed-test.sh \
+            -o "$helper" || { fail "测速组件下载失败；未执行测速。"; return 1; }
     fi
-    if [[ "${1:-}" == "--switch-domain" ]]; then
-        switch_existing_to_domain "${2:-}"
-        return 0
-    fi
+    actual=$(sha256sum "$helper") || return 1
+    [[ "${actual%% *}" == "$SPEED_TEST_SHA256" ]] || {
+        fail "测速入口校验不匹配；请重新下载同一版本的 install.sh 后再试。"
+        return 1
+    }
+    XUI_DB_PATH="$XUI_DB_PATH" XUI_INSTALL_DIR="$XUI_INSTALL_DIR" XUI_INFO_DIR="$XUI_INFO_DIR" \
+        XRAY_BIN="${XRAY_BIN:-}" bash "$helper" "$@"
+}
 
+fresh_install() {
+    if [[ -e "$XUI_DB_PATH" ]]; then
+        fail "检测到已有 3x-ui 数据库，已停止新装。请从菜单选择测速、旧参数修复或添加节点。"
+        return 1
+    fi
     install_deps
     detect_server_ip
     init_config
-    if [[ -e "$XUI_DB_PATH" ]]; then
-        fail "检测到已有 3x-ui 数据库。原位修复旧参数使用 --repair-performance；新增节点使用 --add-nodes；域名迁移使用 --switch-domain。"
-        return 1
-    fi
     check_ports_available
     verify_reality_target
     if [[ "${CERT_MODE:-1}" == "2" ]]; then
@@ -1349,6 +1363,146 @@ main() {
     print_summary
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+print_usage() {
+    cat <<'USAGE'
+用法：bash install.sh [选项]
+  无参数 / --menu             打开管理菜单
+  --install                  全新安装四节点（已有面板时停止）
+  --speed-test [测速参数]     服务器直连与现有节点回环测速
+  --check-performance        只读检查旧参数，可选 --inbound-id ID
+  --repair-performance       原位修复旧参数，可选 --inbound-id ID
+  --repair-performance-status 查询最近一次修复结果
+  --add-nodes                保留原入站，另加四种节点
+  --switch-domain 域名       迁移现有节点证书与连接域名
+  --help                     显示帮助
+AUTO_YES=1 无参数运行保留无人值守全新安装行为。
+USAGE
+}
+
+menu_read_choice() {
+    local menu_target="$1" menu_prompt="$2"
+    if [[ -t 0 ]]; then
+        IFS= read -r -p "$menu_prompt" "${menu_target?}"
+    elif [[ -r /dev/tty ]] && { true </dev/tty; } 2>/dev/null; then
+        IFS= read -r -p "$menu_prompt" "${menu_target?}" </dev/tty
+    else
+        IFS= read -r "${menu_target?}"
+    fi
+}
+
+prepare_menu_runner() {
+    local source_dir name
+    if [[ ! -f "$INSTALLER_SOURCE_FILE" || ! -r "$INSTALLER_SOURCE_FILE" ]]; then
+        fail "菜单需要先将脚本保存为文件。请执行：curl -fLso /tmp/3xuish-install.sh $REPO_RAW_URL && bash /tmp/3xuish-install.sh"
+        return 1
+    fi
+    source_dir="$(cd -- "$(dirname -- "$INSTALLER_SOURCE_FILE")" && pwd)"
+    mkdir -p "$RUN_DIR/menu/lib" "$RUN_DIR/menu/scripts"
+    MENU_RUNNER_PATH="$RUN_DIR/menu/install.sh"
+    cp -- "$INSTALLER_SOURCE_FILE" "$MENU_RUNNER_PATH"
+    if [[ -f "$source_dir/lib/performance_repair.py" ]]; then
+        cp -- "$source_dir/lib/performance_repair.py" "$RUN_DIR/menu/lib/performance_repair.py"
+    fi
+    for name in server-speed-test.sh server_speed_probe.py server_speed_test.py; do
+        if [[ -f "$source_dir/scripts/$name" ]]; then
+            cp -- "$source_dir/scripts/$name" "$RUN_DIR/menu/scripts/$name"
+        fi
+    done
+}
+
+menu_run_action() {
+    local result=0
+    # A separate Bash preserves errexit inside installation and rollback code.
+    # Capturing a shell function in if/|| would disable its failure propagation.
+    if XUI_DB_PATH="$XUI_DB_PATH" XUI_INSTALL_DIR="$XUI_INSTALL_DIR" XUI_INFO_DIR="$XUI_INFO_DIR" \
+        XUI_SERVICE="$XUI_SERVICE" XRAY_BIN="${XRAY_BIN:-}" AUTO_YES=0 bash "$MENU_RUNNER_PATH" "$@"; then
+        log_info "操作已结束，返回管理菜单。"
+    else
+        result=$?
+        log_warn "操作未完成或部分测试失败（退出码：$result）；请查看上方结果。已返回管理菜单。"
+    fi
+}
+
+interactive_menu() {
+    local choice="" domain=""
+    prepare_menu_runner
+    while true; do
+        printf '\n%b3xuish 管理菜单%b\n' "$CYAN" "$PLAIN"
+        if [[ -f "$XUI_DB_PATH" ]]; then
+            printf '面板状态：已安装（发现现有数据库）\n'
+        else
+            printf '面板状态：未发现现有数据库\n'
+        fi
+        printf '%s\n' \
+            '  1) 全新安装四节点（已有面板时停止）' \
+            '  2) 现有节点测速（消耗流量，不修改配置）' \
+            '  3) 检查旧节点参数（只读）' \
+            '  4) 原位修复旧参数（保留原节点与订阅）' \
+            '  5) 添加四种节点（保留原入站，另增四个）' \
+            '  6) 切换现有节点域名' \
+            '  7) 查看最近修复结果' \
+            '  0) 退出'
+        choice=""
+        if ! menu_read_choice choice '请选择 [0-7]：'; then
+            printf '\n输入已结束，退出菜单。\n'
+            return 0
+        fi
+        case "$choice" in
+            0) return 0 ;;
+            1) menu_run_action --install ;;
+            2) menu_run_action --speed-test ;;
+            3) menu_run_action --check-performance ;;
+            4) menu_run_action --repair-performance ;;
+            5) menu_run_action --add-nodes ;;
+            6)
+                domain=""
+                if ! menu_read_choice domain '新域名（留空取消）：'; then return 0; fi
+                if [[ -n "$domain" ]]; then
+                    if valid_domain "$domain"; then
+                        menu_run_action --switch-domain "$domain"
+                    else
+                        log_warn "域名格式无效；未执行切换。"
+                    fi
+                fi
+                ;;
+            7) menu_run_action --repair-performance-status ;;
+            '') ;;
+            *) log_warn "请输入 0–7。" ;;
+        esac
+    done
+}
+
+main() {
+    local action="${1:-}"
+    case "$action" in
+        --help|-h) [[ $# -eq 1 ]] || { fail "帮助选项不能附带其他参数。"; return 1; }; print_usage; return 0 ;;
+        --menu|--install|--add-nodes)
+            [[ $# -eq 1 ]] || { fail "${action} 不接受额外参数。"; return 1; } ;;
+        --switch-domain)
+            [[ $# -le 2 ]] || { fail "--switch-domain 只接受一个域名。"; return 1; } ;;
+        --speed-test|--check-performance|--repair-performance|--repair-performance-status|'') ;;
+        *) fail "未知选项：$action。使用 --help 查看用法。"; return 1 ;;
+    esac
+    init_platform
+    case "$action" in
+        --menu) interactive_menu ;;
+        --install) fresh_install ;;
+        --speed-test) speed_test_command "${@:2}" ;;
+        --check-performance) performance_command check "${@:2}" ;;
+        --repair-performance) performance_command repair "${@:2}" ;;
+        --repair-performance-status) performance_command status "${@:2}" ;;
+        --add-nodes) add_nodes_to_existing ;;
+        --switch-domain) switch_existing_to_domain "${2:-}" ;;
+        '')
+            if [[ "${AUTO_YES:-0}" == 1 ]]; then
+                fresh_install
+            else
+                interactive_menu
+            fi
+            ;;
+    esac
+}
+
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]:-}" == "$0" ]]; then
     main "$@"
 fi

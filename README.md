@@ -4,18 +4,35 @@
 
 默认主用 Hy2，保留三种备用方案。这个顺序来自一次实际链路对照，**不代表 Hy2 在所有网络里都最快**；应以客户端所在网络的实测为准。测试方法与结果见 [性能对照说明](docs/performance.md)。
 
-## 开始安装
+## 打开管理菜单
 
 在服务器的 root 终端执行：
 
 ```bash
-curl -fLso /tmp/3xuish-install.sh https://raw.githubusercontent.com/Iwhrt72/3xuish/main/install.sh
+curl -fLso /tmp/3xuish-install.sh https://raw.githubusercontent.com/Iwhrt72/3xuish/main/install.sh &&
 bash /tmp/3xuish-install.sh
 ```
 
 如果提示没有 `curl`，Debian / Ubuntu 先执行 `apt update && apt install -y curl`；RHEL 系列使用 `dnf install -y curl` 或 `yum install -y curl`。
 
-安装向导会询问证书方式、面板账号、端口以及主用节点。主用节点可以选：
+脚本会显示是否检测到已有面板，并打开菜单：
+
+```text
+1) 全新安装四节点
+2) 服务器与现有节点测速
+3) 检查旧节点参数
+4) 原位修复旧节点参数
+5) 给已有面板添加四节点
+6) 切换域名
+7) 查看修复状态
+0) 退出
+```
+
+已有面板时可以直接选择 `2` 测速，结束后返回菜单。测速不修改配置或重启面板，会消耗测试流量；完整行为和用量见下方“服务器测速”。选择新装时会先检查已有数据库，避免进入安装或覆盖旧配置；添加四节点和原位修复是两个独立选项。
+
+请先下载到文件再执行，以便菜单为每个操作启动独立进程；不要使用 `curl ... | bash` 打开菜单。关闭终端前输入 `0` 退出即可。
+
+选择 `1` 后，安装向导会询问证书方式、面板账号、端口以及主用节点。主用节点可以选：
 
 | 选择 | 适合的用途 | 默认监听 |
 | --- | --- | --- |
@@ -27,6 +44,15 @@ bash /tmp/3xuish-install.sh
 **选择主用节点不会删掉其他节点。** 四种节点都会生成；主用选择决定结尾的推荐标记和分享链接排列顺序。脚本不会从服务器端自动判断客户端到服务器哪条线路最快。
 
 旧入口 `install_3xui_xhttp_vlessenc.sh` 仍可使用，功能与 `install.sh` 保持一致。
+
+已有自动化参数继续可用。`AUTO_YES=1` 无参数运行仍走无人值守新装；也可显式指定操作：
+
+```bash
+bash /tmp/3xuish-install.sh --menu
+bash /tmp/3xuish-install.sh --install
+bash /tmp/3xuish-install.sh --speed-test --seconds 5
+bash /tmp/3xuish-install.sh --speed-test --inbound-id 1 --inbound-id 4
+```
 
 ## 放行需要的端口
 
@@ -145,7 +171,13 @@ bash /tmp/3xuish-install.sh --repair-performance --inbound-id 1
 
 ## 服务器测速，不重装
 
-在服务器 root 终端执行这条独立诊断命令：
+在上方管理菜单选择 `2`，或通过安装脚本直接测速：
+
+```bash
+bash /tmp/3xuish-install.sh --speed-test
+```
+
+独立诊断入口也继续可用。在服务器 root 终端执行：
 
 ```bash
 curl -q -fLso /tmp/3xuish-speed-test.sh https://raw.githubusercontent.com/Iwhrt72/3xuish/main/scripts/server-speed-test.sh &&
