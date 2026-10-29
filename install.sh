@@ -24,6 +24,7 @@ CREATED_IDS=()
 ATTEMPTED_TAGS=()
 ROLLBACK_NEEDED=0
 NODE_PROFILES='[]'
+PERFORMANCE_HELPER_SHA256="c86bd6f77b6aa5268f42aa344aa7942dff0288b4ab0bbf1d2721fd153b2e3075"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -1259,8 +1260,61 @@ add_nodes_to_existing() {
 }
 
 
+performance_command() {
+    local mode="$1" helper bundled actual inbound_id=""; shift
+    while (($#)); do
+        case "$1" in
+            --inbound-id)
+                [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]{0,17}$ ]] || {
+                    fail "--inbound-id 需要一个有效的面板入站 ID。"; return 1;
+                }
+                [[ -z "$inbound_id" && "$mode" != status ]] || {
+                    fail "重复指定入站或在状态查询中指定入站。"; return 1;
+                }
+                inbound_id="$2"; shift 2 ;;
+            *) fail "不支持的性能修复参数：$1"; return 1 ;;
+        esac
+    done
+    command -v python3 >/dev/null 2>&1 || {
+        fail "此功能需要 Python 3.8 或更新版本（python3 命令）。Debian/Ubuntu 可执行 apt-get install -y python3；Alpine 执行 apk add python3。"
+        return 1
+    }
+    python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' >/dev/null 2>&1 || {
+        fail "python3 必须为 Python 3.8 或更新版本；请先安装满足版本要求的 Python，并用 python3 --version 确认。未下载修复组件或修改节点。"
+        return 1
+    }
+    command -v sha256sum >/dev/null 2>&1 || { fail "未找到 sha256sum。"; return 1; }
+    helper="$RUN_DIR/performance_repair.py"
+    bundled="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/performance_repair.py"
+    if [[ -f "$bundled" ]]; then
+        cp -- "$bundled" "$helper" || return 1
+    else
+        curl -fsSL --connect-timeout 10 --max-time 60 \
+            https://raw.githubusercontent.com/Iwhrt72/3xuish/main/lib/performance_repair.py \
+            -o "$helper" || { fail "性能修复组件下载失败；未修改节点。"; return 1; }
+    fi
+    actual=$(sha256sum "$helper") || return 1
+    [[ "${actual%% *}" == "$PERFORMANCE_HELPER_SHA256" ]] || {
+        fail "性能修复组件校验不匹配；请重新下载同一版本的 install.sh 后再试，未执行组件。"
+        return 1
+    }
+    local args=("$mode" --database "$XUI_DB_PATH" --install-dir "$XUI_INSTALL_DIR"
+                --info-dir "$XUI_INFO_DIR" --service "$XUI_SERVICE")
+    if [[ "$mode" == repair ]]; then
+        resolve_xray_binary || return 1
+        args+=(--xray "$XRAY_BIN")
+    fi
+    [[ -z "$inbound_id" ]] || args+=(--inbound-id "$inbound_id")
+    python3 "$helper" "${args[@]}"
+}
+
 main() {
     init_platform
+    case "${1:-}" in
+        --check-performance) performance_command check "${@:2}"; return $? ;;
+        --repair-performance) performance_command repair "${@:2}"; return $? ;;
+        --repair-performance-status) performance_command status "${@:2}"; return $? ;;
+    esac
     if [[ "${1:-}" == "--add-nodes" ]]; then
         add_nodes_to_existing
         return 0
@@ -1274,7 +1328,7 @@ main() {
     detect_server_ip
     init_config
     if [[ -e "$XUI_DB_PATH" ]]; then
-        fail "检测到已有 3x-ui 数据库。添加长期节点请运行 --add-nodes；域名迁移使用 --switch-domain。"
+        fail "检测到已有 3x-ui 数据库。原位修复旧参数使用 --repair-performance；新增节点使用 --add-nodes；域名迁移使用 --switch-domain。"
         return 1
     fi
     check_ports_available

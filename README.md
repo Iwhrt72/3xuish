@@ -92,7 +92,49 @@ AUTO_YES=1 CERT_MODE=2 XUI_DOMAIN=example.com PRIMARY_NODE=hy2 bash /tmp/3xuish-
 
 节点端口和面板端口不能冲突。脚本遇到与本次部署端口冲突的已有入站或监听服务会停止并提示处理，不会盲目覆盖现有入站。
 
-全新部署命令面向未安装 3x-ui 的服务器。已有面板请使用下面的 `--add-nodes`，域名迁移使用 `--switch-domain`。
+全新部署命令面向未安装 3x-ui 的服务器。旧节点原位修复使用 `--repair-performance`，已有面板新增四节点使用 `--add-nodes`，域名迁移使用 `--switch-domain`。
+
+## 修复旧节点，保留原链接
+
+更新脚本文件不会自动修改面板数据库。老用户希望继续使用原节点、端口和订阅链接时，不需要卸载重装，也不必新增节点；先在服务器 root 终端检查：
+
+```bash
+curl -fLso /tmp/3xuish-install.sh https://raw.githubusercontent.com/Iwhrt72/3xuish/main/install.sh &&
+bash /tmp/3xuish-install.sh --check-performance
+```
+
+检查只读取已有配置，输出入站 ID、端口和命中的旧参数，不输出 UUID、密码或私钥。默认识别旧脚本的 `VLESS-XHTTP-Enc-Vision` TLS/XHTTP 入站，以及本脚本已保存资料明确登记的 VLESS 节点。此模式不会安装或升级面板。
+
+服务器的 `python3` 命令需要 Python **3.8 或更新版本**，可用 `python3 --version` 确认。Debian/Ubuntu 可执行 `apt-get install -y python3`，Alpine 执行 `apk add python3`；旧版系统安装后仍须核对版本。版本不足时，脚本会在下载修复组件或修改节点之前停止。
+
+执行原位修复，再查询结果：
+
+```bash
+bash /tmp/3xuish-install.sh --repair-performance
+bash /tmp/3xuish-install.sh --repair-performance-status
+```
+
+| 旧脚本保存的值 | 修复后的行为 |
+| --- | --- |
+| `tcpWindowClamp: 600` | 改为 `0`，取消此接收窗口限制 |
+| `tcpMaxSeg: 1440` | 删除固定 MSS，让系统协商 |
+| `tcpUserTimeout: 10000` | 删除固定的 10 秒超时 |
+| `tcpcongestion: "bbr"` | 删除每连接覆盖，采用系统当前拥塞控制设置 |
+
+只修改表中精确匹配的旧值，其他自定义值保留。系统全局 BBR、缓冲区和防火墙不会被修改。域名、端口、UUID、VLESS Encryption/REALITY 密钥、XHTTP 路径和订阅链接保持原值；修复生效后客户端断开重连即可。
+
+任务会备份数据库和相关文件，先验证候选 Xray 配置，再更新数据库、重启面板并核对实际生成配置及原监听。它独立于 SSH 会话运行，重启导致管理连接断开后仍会继续。`started` 表示已启动，必须以状态查询的 `complete` 为成功依据；`no_changes` 表示没有命中需要修改的旧值。
+
+任务记录和备份位于服务器 `/root/3xuish-performance-repair/` 下的独立目录，仅 root 可读。普通失败会尝试精确回滚本次修改；`rolled_back` 表示修复失败并恢复，`manual_recovery_required` 表示检测到并发修改、后台任务异常中断或恢复异常，应保留该目录检查，不能盲目覆盖整个数据库。异常中断不会一直显示“运行中”，再次修复也会停止并保留上次记录，待核验恢复后处理。
+
+如果旧节点被改名，自动识别没有选中，可在面板确认入站 ID 后显式指定，例如 ID 为 1：
+
+```bash
+bash /tmp/3xuish-install.sh --check-performance --inbound-id 1
+bash /tmp/3xuish-install.sh --repair-performance --inbound-id 1
+```
+
+已经没有旧值的节点会跳过，不重复重启。`--add-nodes` 仍只用于新增方案，不代替原位修复。此功能修正旧配置，实际吞吐量仍取决于当前网络和传输方案；`tcpWindowClamp` 主要影响服务端接收方向，不能把全部下载慢都归因于它。
 
 ## 给已有面板添加节点
 
