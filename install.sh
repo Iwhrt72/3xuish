@@ -132,8 +132,8 @@ validate_config() {
     case "${VLESS_ENC_TYPE:-1}" in 1|2) ;; *) fail "VLESS_ENC_TYPE 只能是 1 或 2。"; return 1 ;; esac
     case "${INBOUND_TLS_MODE:-1}" in 1|2) ;; *) fail "INBOUND_TLS_MODE 只能是 1 或 2。"; return 1 ;; esac
     [[ "${WEB_BASE_PATH:-}" =~ ^[A-Za-z0-9_-]+$ ]] || { fail "面板路径只允许字母、数字、下划线和短横线。"; return 1; }
-    valid_domain "${REALITY_SERVER_NAME:-www.microsoft.com}" || { fail "REALITY_SERVER_NAME 必须为有效域名。"; return 1; }
-    local target="${REALITY_TARGET:-${REALITY_SERVER_NAME:-www.microsoft.com}:443}"
+    valid_domain "${REALITY_SERVER_NAME:-www.apple.com}" || { fail "REALITY_SERVER_NAME 必须为有效域名。"; return 1; }
+    local target="${REALITY_TARGET:-${REALITY_SERVER_NAME:-www.apple.com}:443}"
     [[ "$target" =~ ^([A-Za-z0-9.-]+):([0-9]+)$ ]] && valid_port "${BASH_REMATCH[2]}" || {
         fail "REALITY_TARGET 格式应为 域名:端口。"; return 1;
     }
@@ -519,7 +519,7 @@ init_config() {
     HY2_PORT="${HY2_PORT:-24444}"
     XHTTP_PORT="${XHTTP_PORT:-${INBOUND_PORT:-8443}}"
     PRIMARY_NODE="${PRIMARY_NODE:-hy2}"
-    REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-www.microsoft.com}"
+    REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-www.apple.com}"
     REALITY_TARGET="${REALITY_TARGET:-${REALITY_SERVER_NAME}:443}"
     CERT_MODE="${CERT_MODE:-1}"
     DOMAIN_NAME="${XUI_DOMAIN:-}"
@@ -656,12 +656,26 @@ generate_reality_keys() {
 }
 
 verify_reality_target() {
-    if ! timeout 12 openssl s_client -connect "$REALITY_TARGET" -servername "$REALITY_SERVER_NAME" \
-        -tls1_3 -groups X25519 -verify_return_error -brief </dev/null 2>&1 \
-        | grep -Eiq 'Protocol([[:space:]]+version)?[[:space:]]*:[[:space:]]*TLSv1\.3'; then
-        fail "REALITY_TARGET 无法完成 TLS 1.3 握手；请选可达的握手域名。"
+    local output
+    if ! output=$(timeout 12 openssl s_client -connect "$REALITY_TARGET" -servername "$REALITY_SERVER_NAME" \
+        -tls1_3 -groups X25519 -verify_return_error -verify_hostname "$REALITY_SERVER_NAME" \
+        -alpn h2 </dev/null 2>&1); then
+        fail "REALITY 目标握手或证书名称校验失败；请检查可达性、证书及目标 SNI。"
         return 1
     fi
+    if ! grep -Eiq '(Protocol([[:space:]]+version)?[[:space:]]*:[[:space:]]*|New,[[:space:]]*)TLSv1\.3' <<<"$output"; then
+        fail "REALITY 目标未协商 TLS 1.3；请选择支持 TLS 1.3 的目标站点。"
+        return 1
+    fi
+    if ! grep -Eiq 'ALPN protocol:[[:space:]]*h2[[:space:]]*$' <<<"$output"; then
+        fail "REALITY 目标未协商 HTTP/2（h2）；请选择支持 h2 的目标站点。"
+        return 1
+    fi
+    case "${REALITY_SERVER_NAME,,}" in
+        microsoft.com|*.microsoft.com)
+            log_warn "微软目标曾触发旧版 REALITY 握手记录长度问题；请核对 Xray 版本并在手机端实测。" ;;
+    esac
+    log_info "目标已通过 TLS 1.3、证书名称及 h2 基础检查；此检查不能保证小火箭等客户端兼容。"
 }
 
 # 11. 一次生成四种节点；主用选择只调整展示顺序，不删除备用节点。
@@ -1237,7 +1251,7 @@ add_nodes_to_existing() {
     existing_select_node_port REALITY_PORT 24443 tcp || return 1
     existing_select_node_port HY2_PORT 24444 udp || return 1
     existing_select_node_port XHTTP_PORT 8443 tcp || return 1
-    REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-www.microsoft.com}"
+    REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-www.apple.com}"
     REALITY_TARGET="${REALITY_TARGET:-${REALITY_SERVER_NAME}:443}"
     valid_domain "$REALITY_SERVER_NAME" || { fail "REALITY_SERVER_NAME 无效。"; return 1; }
     XHTTP_PATH="${XHTTP_PATH:-/$(gen_random_str 10)}"
