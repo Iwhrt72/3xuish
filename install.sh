@@ -1199,6 +1199,14 @@ add_nodes_to_existing() {
         return 0
     fi
 
+    # A disconnected SSH session can leave API-created nodes before the final
+    # profile file is written. Allocating new ports here would duplicate them.
+    count=$(sqlite3 -readonly "$XUI_DB_PATH" "SELECT count(*) FROM inbounds WHERE tag GLOB '3xuish-*';") || return 1
+    if [[ "$count" != 0 ]]; then
+        fail "发现 ${count} 个本脚本创建的入站，但正式节点资料缺失，可能是上次部署中断。为避免重复创建，已停止；请先核对数据库备份和 /tmp/3xuish.*/profiles.json，恢复资料后再继续。"
+        return 1
+    fi
+
     PRIMARY_NODE="${PRIMARY_NODE:-hy2}"
     case "$PRIMARY_NODE" in hy2|raw|reality|xhttp) ;; *) fail "PRIMARY_NODE 只能是 hy2、raw、reality 或 xhttp。"; return 1 ;; esac
     if [[ "${AUTO_YES:-0}" != 1 ]]; then
