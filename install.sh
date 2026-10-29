@@ -27,6 +27,7 @@ ROLLBACK_NEEDED=0
 NODE_PROFILES='[]'
 PERFORMANCE_HELPER_SHA256="f2bb9385286065ad700754143de8ce5b8541721f583a1a218c8a697bc2a5ed44"
 SPEED_TEST_SHA256="ad35625188532e12869684997eb919f928aa9b876e3742e3dff6a277e8a2ec0b"
+CLEAN_REINSTALL_SHA256="2c119472f7deade2913e627658342b0833932bc3ada20ea36b04e779db95bb6d"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -583,10 +584,19 @@ install_and_config_3xui() {
     export XUI_DB_TYPE="sqlite"
     export XUI_SSL_MODE="none"
 
-    curl -fsSL --connect-timeout 10 --max-time 90 \
-        https://raw.githubusercontent.com/MHSanaei/3x-ui/main/install.sh \
-        -o "$RUN_DIR/upstream-install.sh"
-    bash "$RUN_DIR/upstream-install.sh" </dev/null
+    if [[ -n "${XUI_UPSTREAM_INSTALLER:-}" ]]; then
+        [[ -s "$XUI_UPSTREAM_INSTALLER" && -f "$XUI_UPSTREAM_INSTALLER" ]] || {
+            fail "预下载的上游安装组件不可用。"; return 1;
+        }
+        cp -- "$XUI_UPSTREAM_INSTALLER" "$RUN_DIR/upstream-install.sh"
+    else
+        curl -fsSL --connect-timeout 10 --max-time 90 \
+            https://raw.githubusercontent.com/MHSanaei/3x-ui/main/install.sh \
+            -o "$RUN_DIR/upstream-install.sh"
+    fi
+    bash -n "$RUN_DIR/upstream-install.sh"
+    # Upstream XUI_SERVICE means the unit directory; ours is a service name.
+    env -u XUI_SERVICE bash "$RUN_DIR/upstream-install.sh" </dev/null
 
     # 确保账号、密码、端口、路径与证书写入面板配置
     log_info "正在配置 3x-ui 面板参数与 SSL 证书..."
@@ -1339,9 +1349,10 @@ speed_test_command() {
 
 fresh_install() {
     if [[ -e "$XUI_DB_PATH" ]]; then
-        fail "检测到已有 3x-ui 数据库，已停止新装。请从菜单选择测速、旧参数修复或添加节点。"
+        fail "检测到已有 3x-ui 数据库，已停止新装。清空后全新部署请选择重装；也可选择测速、旧参数修复或添加节点。"
         return 1
     fi
+    acquire_maintenance_lock
     install_deps
     detect_server_ip
     init_config
@@ -1363,11 +1374,137 @@ fresh_install() {
     print_summary
 }
 
+acquire_maintenance_lock() {
+    local directory="$XUI_INFO_DIR/3xuish-reinstall" lock="$XUI_INFO_DIR/3xuish-reinstall/reinstall.lock"
+    if [[ -n "${XUI_MAINTENANCE_JOB:-}" ]]; then
+        [[ "$XUI_MAINTENANCE_JOB" =~ ^/root/3xuish-reinstall/job-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$ &&
+           "$INSTALLER_SOURCE_FILE" == "$XUI_MAINTENANCE_JOB/installer.sh" &&
+           -f "$XUI_MAINTENANCE_JOB/state.json" ]] || {
+            fail "后台维护任务来源无效，已停止。"; return 1;
+        }
+        python3 - "$XUI_MAINTENANCE_JOB/state.json" <<'PY' || { fail "后台维护任务状态无效，已停止。"; return 1; }
+import json,sys
+state=json.load(open(sys.argv[1],encoding='utf-8'))
+raise SystemExit(not (state.get('status') == 'running' and state.get('operation') == 'reinstall'
+                     and state.get('phase') == 'fresh_installation'))
+PY
+        return 0
+    fi
+    [[ -z "${MAINTENANCE_LOCK_FD:-}" ]] || return 0
+    [[ ! -L "$directory" && ! -L "$lock" ]] || { fail "维护锁路径异常。"; return 1; }
+    mkdir -p "$directory" || return 1
+    chmod 700 "$directory" || return 1
+    exec {MAINTENANCE_LOCK_FD}>"$lock"
+    if command -v flock >/dev/null 2>&1; then
+        flock -n "$MAINTENANCE_LOCK_FD" || { fail "已有安装、重装、卸载或迁移任务运行中，请稍后重试。"; return 1; }
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import fcntl,sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)' \
+            "$MAINTENANCE_LOCK_FD" 2>/dev/null || {
+            fail "无法取得维护锁，可能已有任务运行中。"; return 1;
+        }
+    else
+        fail "需要 flock 或 python3 取得维护锁，请先安装其中一项。"; return 1
+    fi
+    # A dead worker may have already archived data; do not race its recovery.
+    if [[ -f "$directory/latest.json" ]]; then
+        command -v python3 >/dev/null 2>&1 || { fail "需 python3 检查上次维护状态，已停止。"; return 1; }
+        python3 - "$directory" <<'PY' || { fail "上次维护任务尚未完成或需要恢复，请先查询状态。"; return 1; }
+import json,re,sys
+from pathlib import Path
+root=Path(sys.argv[1])
+name=json.loads((root/'latest.json').read_text()).get('job','')
+if not re.fullmatch(r'job-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}',name): raise SystemExit(1)
+state=json.loads((root/name/'state.json').read_text())
+raise SystemExit(state.get('status') in {'starting','running','manual_recovery_required'})
+PY
+    fi
+}
+
+validate_reinstall_target() {
+    local operation="${1:-reinstall}"
+    [[ "$XUI_DB_PATH" == /etc/x-ui/x-ui.db && "$XUI_INSTALL_DIR" == /usr/local/x-ui &&
+       "$XUI_INFO_DIR" == /root && "$XUI_SERVICE" == x-ui ]] || {
+        fail "重装和卸载仅支持默认 SQLite 路径和 x-ui 服务；自定义安装请先人工核验。"; return 1;
+    }
+    if [[ "$operation" == uninstall ]]; then
+        [[ -e /usr/local/x-ui || -e /etc/x-ui || -e /usr/bin/x-ui ||
+           -e /etc/systemd/system/x-ui.service || -e /etc/init.d/x-ui ]] || {
+            fail "未找到可卸载的默认面板部署。"; return 1;
+        }
+    else
+        [[ -f "$XUI_DB_PATH" ]] || { fail "未找到旧面板数据库，请选择全新安装。"; return 1; }
+    fi
+}
+
+maintenance_command() {
+    local operation="$1" mode="$2" confirmation="" helper bundled actual expected="REINSTALL"; shift 2
+    [[ $# -eq 0 ]] || { fail "重装、卸载及状态查询不接受额外参数。"; return 1; }
+    if [[ "$mode" == launch ]]; then
+        validate_reinstall_target "$operation" || return 1
+        if [[ "$operation" == uninstall ]]; then
+            expected="UNINSTALL"
+            printf '\n卸载会停止面板并取消开机启动，备份并移走程序、数据库和节点资料。\n'
+            printf '现有节点与订阅将不可用；保留私有备份、证书及 acme 账户，不自动重装。\n'
+        else
+            printf '\n清空重装会备份并移走旧面板数据，重新生成面板账号、四节点和认证。\n'
+            printf '旧节点与订阅链接将失效，服务会中断；这不是保留配置的升级。\n'
+        fi
+        prompt_read "输入 $expected 确认（其他输入取消）：" confirmation
+        [[ "$confirmation" == "$expected" ]] || { log_info "已取消操作，未修改原配置。"; return 0; }
+    fi
+    command -v python3 >/dev/null 2>&1 &&
+        python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' >/dev/null 2>&1 || {
+            fail "重装和卸载需要 Python 3.8+，请先安装满足要求的 python3。"; return 1;
+        }
+    command -v sha256sum >/dev/null 2>&1 || { fail "未找到 sha256sum。"; return 1; }
+    helper="$RUN_DIR/clean_reinstall.py"
+    bundled="$(cd -- "$(dirname -- "$INSTALLER_SOURCE_FILE")" && pwd)/lib/clean_reinstall.py"
+    if [[ -f "$bundled" ]]; then
+        cp -- "$bundled" "$helper" || return 1
+    else
+        curl -q -fLsS --connect-timeout 10 --max-time 60 \
+            https://raw.githubusercontent.com/Iwhrt72/3xuish/main/lib/clean_reinstall.py \
+            -o "$helper" || { fail "维护组件下载失败，未清空数据。"; return 1; }
+    fi
+    actual=$(sha256sum "$helper") || return 1
+    [[ "${actual%% *}" == "$CLEAN_REINSTALL_SHA256" ]] || {
+        fail "维护组件校验不匹配，请重新下载同一版本安装脚本。"; return 1;
+    }
+    local args=("$mode" --database "$XUI_DB_PATH" --install-dir "$XUI_INSTALL_DIR"
+        --info-dir "$XUI_INFO_DIR" --service "$XUI_SERVICE" --operation "$operation")
+    if [[ "$mode" == launch && "$operation" == reinstall ]]; then
+        # Collect the new installation choices while SSH and the old panel run.
+        install_deps
+        detect_server_ip
+        init_config
+        export AUTO_YES=1 XUI_SERVER_IP="$SERVER_IP" PRIMARY_NODE CERT_MODE
+        export XUI_DOMAIN="$DOMAIN_NAME" XUI_USERNAME="$PANEL_USER" XUI_PASSWORD="$PANEL_PASS"
+        export XUI_PANEL_PORT="$PANEL_PORT" XUI_WEB_BASE_PATH="$WEB_BASE_PATH"
+        export RAW_PORT REALITY_PORT HY2_PORT XHTTP_PORT XHTTP_PATH VLESS_ENC_TYPE INBOUND_TLS_MODE
+        export REALITY_SERVER_NAME REALITY_TARGET
+        curl -q -fLsS --connect-timeout 10 --max-time 90 \
+            https://raw.githubusercontent.com/MHSanaei/3x-ui/main/install.sh \
+            -o "$RUN_DIR/reinstall-upstream.sh" || {
+                fail "上游安装组件预下载失败，旧面板仍在运行。"; return 1;
+            }
+        bash -n "$RUN_DIR/reinstall-upstream.sh" || { fail "上游安装组件语法检查失败。"; return 1; }
+        args+=(--installer "$INSTALLER_SOURCE_FILE" --upstream-installer "$RUN_DIR/reinstall-upstream.sh")
+    fi
+    python3 "$helper" "${args[@]}"
+}
+
+reinstall_command() { maintenance_command reinstall "$@"; }
+uninstall_command() { maintenance_command uninstall "$@"; }
+
 print_usage() {
     cat <<'USAGE'
 用法：bash install.sh [选项]
   无参数 / --menu             打开管理菜单
   --install                  全新安装四节点（已有面板时停止）
+  --reinstall                清空旧数据后全新部署（需输入 REINSTALL 确认）
+  --reinstall-status         查询清空重装任务结果
+  --uninstall                卸载面板、程序和节点数据（需输入 UNINSTALL 确认）
+  --uninstall-status         查询卸载任务结果
   --speed-test [测速参数]     服务器直连与现有节点回环测速
   --check-performance        只读检查旧参数，可选 --inbound-id ID
   --repair-performance       原位修复旧参数，可选 --inbound-id ID
@@ -1402,6 +1539,9 @@ prepare_menu_runner() {
     cp -- "$INSTALLER_SOURCE_FILE" "$MENU_RUNNER_PATH"
     if [[ -f "$source_dir/lib/performance_repair.py" ]]; then
         cp -- "$source_dir/lib/performance_repair.py" "$RUN_DIR/menu/lib/performance_repair.py"
+    fi
+    if [[ -f "$source_dir/lib/clean_reinstall.py" ]]; then
+        cp -- "$source_dir/lib/clean_reinstall.py" "$RUN_DIR/menu/lib/clean_reinstall.py"
     fi
     for name in server-speed-test.sh server_speed_probe.py server_speed_test.py; do
         if [[ -f "$source_dir/scripts/$name" ]]; then
@@ -1441,9 +1581,13 @@ interactive_menu() {
             '  5) 添加四种节点（保留原入站，另增四个）' \
             '  6) 切换现有节点域名' \
             '  7) 查看最近修复结果' \
+            '  8) 清空后全新部署（旧节点与订阅失效）' \
+            '  9) 查看清空重装结果' \
+            '  10) 卸载面板与节点（保留私有备份和证书）' \
+            '  11) 查看卸载结果' \
             '  0) 退出'
         choice=""
-        if ! menu_read_choice choice '请选择 [0-7]：'; then
+        if ! menu_read_choice choice '请选择 [0-11]：'; then
             printf '\n输入已结束，退出菜单。\n'
             return 0
         fi
@@ -1466,8 +1610,12 @@ interactive_menu() {
                 fi
                 ;;
             7) menu_run_action --repair-performance-status ;;
+            8) menu_run_action --reinstall ;;
+            9) menu_run_action --reinstall-status ;;
+            10) menu_run_action --uninstall ;;
+            11) menu_run_action --uninstall-status ;;
             '') ;;
-            *) log_warn "请输入 0–7。" ;;
+            *) log_warn "请输入 0–11。" ;;
         esac
     done
 }
@@ -1476,7 +1624,7 @@ main() {
     local action="${1:-}"
     case "$action" in
         --help|-h) [[ $# -eq 1 ]] || { fail "帮助选项不能附带其他参数。"; return 1; }; print_usage; return 0 ;;
-        --menu|--install|--add-nodes)
+        --menu|--install|--add-nodes|--reinstall|--reinstall-status|--uninstall|--uninstall-status)
             [[ $# -eq 1 ]] || { fail "${action} 不接受额外参数。"; return 1; } ;;
         --switch-domain)
             [[ $# -le 2 ]] || { fail "--switch-domain 只接受一个域名。"; return 1; } ;;
@@ -1487,12 +1635,16 @@ main() {
     case "$action" in
         --menu) interactive_menu ;;
         --install) fresh_install ;;
+        --reinstall) reinstall_command launch ;;
+        --reinstall-status) reinstall_command status ;;
+        --uninstall) uninstall_command launch ;;
+        --uninstall-status) uninstall_command status ;;
         --speed-test) speed_test_command "${@:2}" ;;
         --check-performance) performance_command check "${@:2}" ;;
-        --repair-performance) performance_command repair "${@:2}" ;;
+        --repair-performance) acquire_maintenance_lock; performance_command repair "${@:2}" ;;
         --repair-performance-status) performance_command status "${@:2}" ;;
-        --add-nodes) add_nodes_to_existing ;;
-        --switch-domain) switch_existing_to_domain "${2:-}" ;;
+        --add-nodes) acquire_maintenance_lock; add_nodes_to_existing ;;
+        --switch-domain) acquire_maintenance_lock; switch_existing_to_domain "${2:-}" ;;
         '')
             if [[ "${AUTO_YES:-0}" == 1 ]]; then
                 fresh_install

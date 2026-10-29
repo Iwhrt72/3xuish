@@ -23,6 +23,7 @@ def script_fixture(directory, overrides=""):
 init_platform() {
     RUN_DIR=$(mktemp -d "$TEST_MOCK_DIR/run.XXXXXXXX")
 }
+acquire_maintenance_lock() { :; }
 install_deps() { printf 'UNEXPECTED_DEPENDENCIES\n'; return 77; }
 ''' + overrides + r'''
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
@@ -37,7 +38,8 @@ fi
 def execute_fixture(directory, path, arguments=(), input_text=""):
     environment = os.environ.copy()
     environment.update(TEST_MOCK_DIR=bash_directory(directory), TEST_SCRIPT=bash_directory(path),
-                       XUI_DB_PATH=bash_directory(directory / "live.db"), AUTO_YES="0")
+                       XUI_DB_PATH=bash_directory(directory / "live.db"),
+                       XUI_INFO_DIR=bash_directory(directory / "info"), AUTO_YES="0")
     result = subprocess.run([bash_binary(), "-lc", 'bash "$TEST_SCRIPT" "$@"', "fixture", *arguments],
                             cwd=REPO, input=input_text.encode("utf-8"), capture_output=True,
                             timeout=15, env=environment)
@@ -83,6 +85,7 @@ source ./install.sh
 XUI_DB_PATH="$TEST_MOCK_DIR/does-not-exist.db"
 AUTO_YES=1
 init_platform() { RUN_DIR="$TEST_MOCK_DIR"; }
+acquire_maintenance_lock() { :; }
 install_deps() { printf 'FRESH_INSTALL_SELECTED\n'; return 74; }
 prompt_read() { printf 'UNEXPECTED_PROMPT\n'; return 75; }
 main
@@ -120,14 +123,18 @@ speed_test_command() { printf 'ACTION_SPEED:%s\n' "$*"; }
 performance_command() { printf 'ACTION_PERFORMANCE:%s\n' "$*"; }
 add_nodes_to_existing() { printf 'ACTION_ADD_NODES\n'; }
 switch_existing_to_domain() { printf 'ACTION_DOMAIN:%s\n' "$1"; }
+reinstall_command() { printf 'ACTION_REINSTALL:%s\n' "$1"; }
+uninstall_command() { printf 'ACTION_UNINSTALL:%s\n' "$1"; }
 '''
         with tempfile.TemporaryDirectory(prefix="installer-menu-", dir=REPO) as temp:
             directory = Path(temp)
             result = execute_fixture(directory, script_fixture(directory, overrides), ("--menu",),
-                                     "2\n3\n4\n5\n6\nexample.test\n7\n0\n")
+                                     "2\n3\n4\n5\n6\nexample.test\n7\n8\n9\n10\n11\n0\n")
             self.assertEqual(result.returncode, 0, result.stderr)
             for marker in ("ACTION_SPEED:", "ACTION_PERFORMANCE:check", "ACTION_PERFORMANCE:repair",
-                           "ACTION_ADD_NODES", "ACTION_DOMAIN:example.test", "ACTION_PERFORMANCE:status"):
+                           "ACTION_ADD_NODES", "ACTION_DOMAIN:example.test", "ACTION_PERFORMANCE:status",
+                           "ACTION_REINSTALL:launch", "ACTION_REINSTALL:status",
+                           "ACTION_UNINSTALL:launch", "ACTION_UNINSTALL:status"):
                 self.assertIn(marker, result.stdout, result.stdout)
             self.assertGreaterEqual(result.stdout.count("3xuish 管理菜单"), 7)
             self.assertNotIn("UNEXPECTED_DEPENDENCIES", result.stdout + result.stderr)
@@ -225,6 +232,106 @@ XRAY_BIN="$TEST_MOCK_DIR/custom-xray"
             self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertNotIn("UNEXPECTED_HELPER_EXECUTED", result.stdout + result.stderr)
             self.assertNotIn("UNEXPECTED_DEPENDENCIES", result.stdout + result.stderr)
+
+
+class CleanReinstallEntrypoint(unittest.TestCase):
+    def test_helper_hash_matches_published_component(self):
+        script = (REPO / "install.sh").read_text(encoding="utf-8")
+        match = re.search(r'^CLEAN_REINSTALL_SHA256="([a-f0-9]{64})"$', script, re.M)
+        self.assertIsNotNone(match)
+        self.assertEqual(match[1], hashlib.sha256((REPO / "lib/clean_reinstall.py").read_bytes()).hexdigest())
+
+    def test_cancel_and_auto_yes_never_launch_or_install(self):
+        for operation, confirmation in ((operation, confirmation)
+                for operation in ("reinstall", "uninstall")
+                for confirmation in ("", "yes", "reinstall", "uninstall")):
+            with self.subTest(operation=operation, confirmation=confirmation):
+                result = run_bash(r'''
+source ./install.sh
+AUTO_YES=1
+validate_reinstall_target() { :; }
+prompt_read() { printf -v "$2" '%s' "$TEST_CONFIRM"; }
+install_deps() { printf 'UNEXPECTED_DEPENDENCIES\n'; return 92; }
+python3() { printf 'UNEXPECTED_PYTHON\n'; return 93; }
+curl() { printf 'UNEXPECTED_DOWNLOAD\n'; return 94; }
+"${TEST_OPERATION}_command" launch
+''', extra_env={"TEST_CONFIRM": confirmation, "TEST_OPERATION": operation})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("UNEXPECTED_", result.stdout + result.stderr)
+
+    def test_custom_layout_is_rejected_before_confirmation_or_dependencies(self):
+        result = run_bash(r'''
+source ./install.sh
+XUI_INSTALL_DIR=/tmp/custom-panel
+prompt_read() { printf 'UNEXPECTED_PROMPT\n'; return 91; }
+install_deps() { printf 'UNEXPECTED_DEPENDENCIES\n'; return 92; }
+reinstall_command launch
+''')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("UNEXPECTED_", result.stdout + result.stderr)
+
+    def test_upstream_install_does_not_inherit_service_name_as_unit_directory(self):
+        with tempfile.TemporaryDirectory(prefix="installer-menu-", dir=REPO) as temp:
+            result = run_bash(r'''
+source ./install.sh
+RUN_DIR="$TEST_MOCK_DIR"
+export XUI_SERVICE=x-ui
+PANEL_USER=fixture-user
+PANEL_PASS=fixture-password
+PANEL_PORT=20530
+WEB_BASE_PATH=fixture-path
+curl() {
+    cat >"$RUN_DIR/upstream-install.sh" <<'FIXTURE'
+#!/usr/bin/env bash
+printf 'UPSTREAM_SERVICE:%s\n' "${XUI_SERVICE:-unit-directory-default}"
+exit 79
+FIXTURE
+}
+install_and_config_3xui
+''', extra_env={"TEST_MOCK_DIR": bash_directory(Path(temp))})
+            self.assertEqual(result.returncode, 79, result.stderr)
+            self.assertIn("UPSTREAM_SERVICE:unit-directory-default", result.stdout)
+            self.assertNotIn("UPSTREAM_SERVICE:x-ui", result.stdout)
+
+
+@unittest.skipUnless(os.name == "posix", "maintenance locks require POSIX flock")
+class MaintenanceLockEntrypoint(unittest.TestCase):
+    def test_other_mutating_command_stops_while_maintenance_owns_shared_lock(self):
+        import fcntl
+        with tempfile.TemporaryDirectory(prefix="installer-lock-", dir=REPO) as temp:
+            directory = Path(temp)
+            lock_dir = directory / "3xuish-reinstall"
+            lock_dir.mkdir()
+            with open(lock_dir / "reinstall.lock", "w") as descriptor:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                result = run_bash(r'''
+source ./install.sh
+XUI_INFO_DIR="$TEST_MOCK_DIR"
+init_platform() { :; }
+add_nodes_to_existing() { printf 'UNSAFE_ADD_NODES\n'; }
+main --add-nodes
+''', extra_env={"TEST_MOCK_DIR": str(directory)})
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertNotIn("UNSAFE_ADD_NODES", result.stdout + result.stderr)
+
+    def test_incomplete_previous_job_blocks_mutation_after_worker_exits(self):
+        import json
+        with tempfile.TemporaryDirectory(prefix="installer-lock-", dir=REPO) as temp:
+            directory = Path(temp)
+            lock_dir = directory / "3xuish-reinstall"
+            job = lock_dir / "job-20261029T050000Z-123456abcdef"
+            job.mkdir(parents=True)
+            (lock_dir / "latest.json").write_text(json.dumps({"job": job.name}))
+            (job / "state.json").write_text(json.dumps({"status": "running"}))
+            result = run_bash(r'''
+source ./install.sh
+XUI_INFO_DIR="$TEST_MOCK_DIR"
+init_platform() { :; }
+performance_command() { printf 'UNSAFE_REPAIR\n'; }
+main --repair-performance
+''', extra_env={"TEST_MOCK_DIR": str(directory)})
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertNotIn("UNSAFE_REPAIR", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
