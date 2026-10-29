@@ -21,6 +21,12 @@ GUARD_COLUMNS = ("tag", "port", "protocol", "enable", "listen", "settings", "rem
 FIELDS = {"tcpWindowClamp": (600, 0), "tcpMaxSeg": (1440, None),
           "tcpUserTimeout": (10000, None), "tcpcongestion": ("bbr", None)}
 ROOT_NAME = "3xuish-performance-repair"
+JOB_NAME = r"job-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}"
+
+
+def public_label(value, allowed):
+    """Do not echo arbitrary database strings in diagnostic output."""
+    return value if isinstance(value, str) and value in allowed else "unknown"
 
 
 class RepairError(RuntimeError):
@@ -111,26 +117,56 @@ def make_plan(database, manifest_path=None, inbound_id=None):
         except (ValueError, TypeError, KeyError):
             raise RepairError("manifest_database_mismatch") from None
     plan = []
+    checked = []
     for row in rows.values():
-        if inbound_id is not None:
-            if row["id"] != inbound_id:
-                continue
-        elif row["protocol"] != "vless" or (row["remark"] != "VLESS-XHTTP-Enc-Vision" and row["tag"] not in managed):
+        explicit = row["id"] == inbound_id
+        expected = explicit or (inbound_id is None and row["protocol"] == "vless"
+                                and (len(rows) == 1 or row["remark"] == "VLESS-XHTTP-Enc-Vision" or row["tag"] in managed))
+        node = {"id": row["id"], "port": row["port"], "enabled": bool(row["enable"]),
+                "protocol": public_label(row["protocol"], {"vless", "vmess", "trojan", "shadowsocks",
+                    "dokodemo-door", "socks", "http", "wireguard", "hysteria", "mixed", "tun"}),
+                "network": "unknown", "security": "unknown", "selected": False,
+                "reason": "unrecognized_inbound", "legacy_fields": []}
+        checked.append(node)
+        try:
+            stream = object_json(row["stream_settings"], "invalid_stream_json")
+        except RepairError:
+            if expected:
+                raise
+            node["reason"] = "not_requested" if inbound_id is not None and not explicit else "invalid_stream_json"
             continue
-        stream = object_json(row["stream_settings"], "invalid_stream_json")
-        object_json(row["settings"], "invalid_settings_json")
-        supported = row["protocol"] == "vless" and stream.get("network", stream.get("method")) in NETWORKS
+        network = stream.get("network", stream.get("method"))
+        node["network"] = public_label(network, NETWORKS | {"ws", "httpupgrade", "grpc", "h2", "kcp", "quic", "hysteria"})
+        node["security"] = public_label(stream.get("security", "none"), {"tls", "reality", "none"})
+        supported = row["protocol"] == "vless" and isinstance(network, str) and network in NETWORKS
         legacy = (supported and row["remark"] == "VLESS-XHTTP-Enc-Vision"
                   and stream.get("network", stream.get("method")) in {"xhttp", "splithttp"}
                   and stream.get("security") == "tls")
-        selected = (row["id"] == inbound_id) if inbound_id is not None else (legacy or row["tag"] in managed)
+        single = len(rows) == 1 and supported
+        selected = explicit if inbound_id is not None else (legacy or row["tag"] in managed or single)
+        if not supported:
+            if explicit:
+                raise RepairError("explicit_inbound_is_not_vless_tcp")
+            selected = False
+        try:
+            after, changes = repair_stream(stream)
+        except RepairError:
+            if selected:
+                raise
+            node["reason"] = "not_requested" if inbound_id is not None and not explicit else "invalid_sockopt"
+            continue
+        node["legacy_fields"] = [change["field"] for change in changes]
+        node["selected"] = selected
+        if inbound_id is not None and not explicit:
+            node["reason"] = "not_requested"
+        elif not supported:
+            node["reason"] = "unsupported_protocol" if row["protocol"] != "vless" else "unsupported_transport"
+        elif selected:
+            node["reason"] = ("explicit_inbound" if explicit else "managed_profile" if row["tag"] in managed
+                              else "legacy_installer" if legacy else "single_inbound")
         if not selected:
             continue
-        if not supported:
-            if inbound_id is not None:
-                raise RepairError("explicit_inbound_is_not_vless_tcp")
-            continue
-        after, changes = repair_stream(stream)
+        object_json(row["settings"], "invalid_settings_json")
         if not changes:
             continue
         item = {"id": row["id"], "tag": row["tag"], "port": row["port"], "enable": bool(row["enable"]),
@@ -145,14 +181,35 @@ def make_plan(database, manifest_path=None, inbound_id=None):
     manifest_after = None
     if manifest_before is not None and any(item["tag"] in managed for item in plan):
         manifest_after = json.dumps(manifest, indent=2, ensure_ascii=False).encode()
-    return {"rows": plan, "manifest_before": manifest_before, "manifest_after": manifest_after}
+    return {"rows": plan, "manifest_before": manifest_before, "manifest_after": manifest_after,
+            "checked_nodes": checked}
+
+
+def plan_details(plan):
+    checked = plan.get("checked_nodes", [])
+    selected = sum(node["selected"] for node in checked)
+    unresolved = [node["id"] for node in checked if not node["selected"] and node["legacy_fields"]
+                  and node["protocol"] == "vless" and node["reason"] != "not_requested"]
+    review = bool(unresolved) or any(node["protocol"] == "vless" and
+                                   node["reason"] in {"invalid_stream_json", "invalid_sockopt"} for node in checked)
+    reason = ("legacy_values_found" if plan["rows"] else "selected_nodes_clean" if selected
+              else "no_recognized_nodes" if checked else "no_inbounds")
+    message = {"legacy_values_found": "已识别需要修复的旧参数。",
+               "selected_nodes_clean": "已检查选中的入站，没有命中需要修复的旧参数。",
+               "no_recognized_nodes": "已扫描入站，但没有自动选中可修复的旧节点；未修改配置。",
+               "no_inbounds": "数据库中没有入站；未修改配置。"}[reason]
+    if review:
+        message += " 另有未自动处理的旧参数或无法检查的入站，请查看 checked_nodes；不能据此判定全部入站已修复。"
+    return {"nodes": [{"id": item["id"], "port": item["port"], "enabled": item["enable"],
+                       "changes": item["changes"]} for item in plan["rows"]],
+            "checked_nodes": checked, "counts": {"total": len(checked), "selected": selected, "repair": len(plan["rows"])},
+            "reason": reason, "message": message, "unselected_legacy_nodes": unresolved,
+            "review_required": review, "scope_complete": not review,
+            "identity_preserved": True, "system_settings_changed": False}
 
 
 def summarize(plan):
-    return {"status": "changes_available" if plan["rows"] else "no_changes",
-            "nodes": [{"id": item["id"], "port": item["port"], "enabled": item["enable"],
-                       "changes": item["changes"]} for item in plan["rows"]],
-            "identity_preserved": True, "system_settings_changed": False}
+    return {"status": "changes_available" if plan["rows"] else "no_changes", **plan_details(plan)}
 
 
 def normalized_stream(stream):
@@ -258,7 +315,7 @@ def snapshot_listeners(adapter):
 
 def write_state(job, status, **extra):
     result = {"status": status, "updated_at": utc_now(), "pid": os.getpid(),
-              "backup_directory": str(job), **extra}
+              "backup_directory": str(job), "job_directory": str(job), **extra}
     atomic_json(Path(job) / "state.json", result)
     return result
 
@@ -382,10 +439,10 @@ def execute_repair(config, job_dir, adapter=None):
     try:
         plan = make_plan(config["database"], manifest_path, config.get("inbound_id"))
         if not plan["rows"]:
-            return {"status": "no_changes", "nodes": [], "identity_preserved": True}
+            return summarize(plan)
         job.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(job, 0o700)
-        write_state(job, "running", nodes=summarize(plan)["nodes"])
+        write_state(job, "running", **plan_details(plan))
         if not adapter.is_active():
             raise RepairError("panel_not_active")
         runtime_path = Path(config["install_dir"]) / "bin/config.json"
@@ -428,8 +485,11 @@ def execute_repair(config, job_dir, adapter=None):
             manifest_written = True
         adapter.restart()
         verify_after(config, plan, adapter, baseline)
-        return write_state(job, "complete", nodes=summarize(plan)["nodes"],
-                           identity_preserved=True, subscription_links_unchanged=True)
+        details = plan_details(plan)
+        details["message"] = "旧参数已修复，生成配置和原监听已验证；原节点与订阅链接保持不变。"
+        if details["review_required"]:
+            details["message"] += " 另有未自动处理的入站，请查看 checked_nodes。"
+        return write_state(job, "complete", **details, subscription_links_unchanged=True)
     except Exception as exc:
         code = str(exc) if isinstance(exc, RepairError) else type(exc).__name__
         conflicts = []
@@ -456,18 +516,13 @@ def execute_repair(config, job_dir, adapter=None):
         return result
 
 
-def read_latest(config):
+def read_job(config, job_directory):
     root = Path(config["info_dir"]) / ROOT_NAME
-    latest = root / "latest.json"
-    if root.is_symlink() or latest.is_symlink():
+    job = Path(job_directory)
+    if (root.is_symlink() or job.is_symlink() or job.parent != root
+            or not re.fullmatch(JOB_NAME, job.name)):
         raise RepairError("unexpected_status_path")
-    if not latest.is_file():
-        return {"status": "no_previous_job"}
-    value = json.loads(latest.read_text())
-    name = value.get("job", "")
-    if not re.fullmatch(r"job-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}", name):
-        raise RepairError("invalid_job_pointer")
-    path = root / name / "state.json"
+    path = job / "state.json"
     if path.is_symlink():
         raise RepairError("unexpected_state_path")
     state = json.loads(path.read_text())
@@ -497,6 +552,20 @@ def read_latest(config):
         os.close(descriptor)
 
 
+def read_latest(config):
+    root = Path(config["info_dir"]) / ROOT_NAME
+    latest = root / "latest.json"
+    if root.is_symlink() or latest.is_symlink():
+        raise RepairError("unexpected_status_path")
+    if not latest.is_file():
+        return {"status": "no_previous_job"}
+    value = json.loads(latest.read_text())
+    name = value.get("job", "")
+    if not re.fullmatch(JOB_NAME, name):
+        raise RepairError("invalid_job_pointer")
+    return read_job(config, root / name)
+
+
 def launch_repair(config):
     import fcntl
     root = Path(config["info_dir"]) / ROOT_NAME
@@ -512,20 +581,40 @@ def launch_repair(config):
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return {"status": "busy", "message": "A repair is still running; use status."}
+            active = read_latest(config)
+            if active["status"] not in {"starting", "running"}:
+                # Another launcher may hold the lock before publishing its new
+                # pointer. The previous terminal job is not that launch's result.
+                return {"status": "busy", "message": "已有任务正在准备或收尾；请稍后重新运行本命令。"}
+            if active:
+                try:
+                    active_config = Path(active.get("job_directory") or active.get("backup_directory")) / "config.json"
+                    if active_config.is_symlink():
+                        raise ValueError()
+                    running = json.loads(active_config.read_text())
+                    if not isinstance(running, dict):
+                        raise ValueError()
+                    if any(running.get(key) != config.get(key) for key in
+                           ("database", "inbound_id", "install_dir", "service")):
+                        raise ValueError()
+                except (OSError, ValueError, TypeError, KeyError):
+                    return {"status": "busy", "message": "已有任务运行中，无法确认与本次目标一致；请等待结束后重新运行本命令。"}
+            return {**active, "status": "busy", "message": "已有修复任务运行中，正在等待其结果。"}
         previous = read_latest(config)
         if previous["status"] in {"starting", "running", "manual_recovery_required"}:
             return {**previous, "status": "manual_recovery_required",
                     "error": previous.get("error", "worker_interrupted")}
         plan = make_plan(config["database"], Path(config["info_dir"]) / "3x-ui-node-profiles.json", config.get("inbound_id"))
-        if not plan["rows"]:
-            return {"status": "no_changes", "nodes": [], "identity_preserved": True}
         name = "job-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:12]
         job = root / name
         job.mkdir(mode=0o700)
+        if not plan["rows"]:
+            result = write_state(job, "no_changes", **plan_details(plan))
+            atomic_json(root / "latest.json", {"job": name})
+            return result
         private_write(job / "worker.py", Path(__file__).read_bytes())
         private_write(job / "config.json", json.dumps(config))
-        write_state(job, "starting", nodes=summarize(plan)["nodes"])
+        write_state(job, "starting", **plan_details(plan))
         atomic_json(root / "latest.json", {"job": name})
         log_fd = os.open(job / "worker.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
@@ -537,10 +626,28 @@ def launch_repair(config):
             raise
         finally:
             os.close(log_fd)
-        return {"status": "started", "pid": process.pid, "backup_directory": str(job),
-                "message": "Repair continues independently of SSH. Use --repair-performance-status to verify completion."}
+        return {"status": "started", "pid": process.pid, "backup_directory": str(job), "job_directory": str(job),
+                "message": "修复任务已启动，正在等待最终结果；SSH 断开后后台任务仍会继续。"}
     finally:
         os.close(descriptor)
+
+
+def wait_for_completion(config, result, timeout=60, interval=0.5):
+    if result["status"] not in {"started", "busy", "starting", "running"}:
+        return result
+    job_directory = result.get("job_directory", result.get("backup_directory"))
+    if not job_directory:
+        return result
+    deadline = time.monotonic() + max(timeout, 0)
+    while True:
+        state = read_job(config, job_directory)
+        if state["status"] not in {"starting", "running"}:
+            return state
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {**state, "wait_timed_out": True,
+                    "message": "等待最终结果超时，后台任务仍在运行；请用 --repair-performance-status 查询。"}
+        time.sleep(min(max(interval, 0.01), remaining))
 
 
 def main(argv=None):
@@ -583,8 +690,12 @@ def main(argv=None):
         if not config["xray"] or not Path(config["xray"]).is_file():
             raise RepairError("xray_binary_missing")
         result = launch_repair(config)
+        if result["status"] in {"started", "busy"}:
+            print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+            result = wait_for_completion(config, result)
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if result["status"] not in {"failed", "rolled_back", "manual_recovery_required"} else 1
+    return 0 if (result["status"] not in {"failed", "rolled_back", "manual_recovery_required"}
+                 and not (result["status"] == "no_changes" and result.get("review_required"))) else 1
 
 
 if __name__ == "__main__":
