@@ -219,6 +219,29 @@ fi
             self.assertEqual(self.rows(directory),[(ORIGINAL_ID,"original-xhttp",443,json.dumps(ORIGINAL_SETTINGS),original)])
             self.assertFalse((directory/"info/3x-ui-node-profiles.json").exists())
 
+    def test_missing_final_profiles_never_duplicates_existing_managed_nodes(self):
+        with tempfile.TemporaryDirectory(prefix="installer-existing-",dir=REPO) as temp:
+            directory=Path(temp)
+            self.fixture(directory)
+            source=SHELL_FIXTURE+r'''
+add_nodes_to_existing >/dev/null
+rm "$XUI_INFO_DIR/3x-ui-node-profiles.json"
+if add_nodes_to_existing; then
+  printf 'UNEXPECTED_SUCCESS\n'
+else
+  printf 'INCOMPLETE_BATCH_REJECTED\n'
+fi
+'''
+            result=run_bash(source,extra_env=self.env(directory))
+            self.assertEqual(result.returncode,0,result.stderr[-1500:])
+            self.assertIn("INCOMPLETE_BATCH_REJECTED",result.stdout)
+            self.assertNotIn("UNEXPECTED_SUCCESS",result.stdout)
+            self.assertEqual(len(self.rows(directory)),5)
+            events=(directory/"api-events").read_text().splitlines()
+            self.assertEqual(events.count("POST /panel/api/inbounds/add"),4)
+            self.assertEqual((directory/"key-events").read_text().splitlines(),["keys"])
+            self.assertFalse((directory/"info/3x-ui-node-profiles.json").exists())
+
     def test_failed_existing_verification_cannot_report_success_in_conditional(self):
         with tempfile.TemporaryDirectory(prefix="installer-existing-",dir=REPO) as temp:
             directory=Path(temp)

@@ -96,3 +96,11 @@ python3 -m unittest discover -s tests -v
 ```
 
 真实面板与内核验证的可执行容器命令保存在 `.github/workflows/test.yml`；三个任务都使用临时环境和只读仓库挂载。正式部署必须使用与这些验证对应的提交，不应把“本地修改完成”“推送分支”“合入 main”和“测速服务器部署完成”混称为已发布或已部署。
+
+## 部署断线后的补充发现
+
+F-06（medium、可靠性、validated）：SSH 在 API 已创建四个入站、正式 profiles 尚未保存时断开，可能用 SIGPIPE/SIGHUP 结束安装进程。此前的 32 项测试未覆盖此中断边界。隔离故障注入观察到原一条加新四条留在数据库、正式 profiles 缺失；直接重跑旧代码会变为九条入站。独立重定向输出的控制组则正常完成。
+
+追加流程现会检查数据库中的安装器入站；发现已有此类入站但缺少正式 profiles 时停止，避免重新分配端口和认证值。新增回归 `ExistingInstallation.test_missing_final_profiles_never_duplicates_existing_managed_nodes` 验证重跑不新增、不生成新凭据、不把中断误报为成功。
+
+这项保护不会自动认定旧批次成功，也不会猜测或覆盖认证参数。实际恢复应先核对原数据库备份、当前入站、临时 profiles 与运行配置。经由正在重启的代理连接 SSH 时，应采用独立管理连接或与 SSH 脱离的持久任务；已断开批次应先检查状态，不能直接重跑新建流程。
