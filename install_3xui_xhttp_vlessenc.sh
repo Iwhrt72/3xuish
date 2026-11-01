@@ -2722,16 +2722,7 @@ print_mptcp_hint() {
     log_warn "Linux 内核漏洞需通过系统包管理器安装修复后的内核并重启才能根治；当前运行内核：$(uname -r)。"
 }
 
-update_xray_core() {
-    local mode="${1:-}" tag latest current asset archive runtime target backup before="" was_running=0
-    if [[ "$mode" == --auto ]]; then
-        RED='' GREEN='' YELLOW='' CYAN='' PLAIN=''
-        printf '\n[%s] Xray 自动更新检查\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        if [[ ! -d "$XUI_INSTALL_DIR/bin" ]]; then
-            log_info "未检测到 3x-ui 程序目录 ${XUI_INSTALL_DIR}/bin，本次跳过。"
-            return 0
-        fi
-    fi
+xray_require_binary() {
     local tool
     for tool in curl jq sha256sum ss; do
         command -v "$tool" >/dev/null 2>&1 || { fail "缺少 ${tool}，请先安装后重试；内核未改动。"; return 1; }
@@ -2740,7 +2731,74 @@ update_xray_core() {
     [[ "$XRAY_BIN" == "$XUI_INSTALL_DIR/bin/xray-linux-"* && -f "$XRAY_BIN" && ! -L "$XRAY_BIN" ]] || {
         fail "只支持更新 ${XUI_INSTALL_DIR}/bin 下由面板管理的 Xray 内核：${XRAY_BIN}"; return 1;
     }
+}
+
+xray_backup_file() { printf '%s\n' "$XUI_INFO_DIR/3xuish-xray-backup/${XRAY_BIN##*/}.previous"; }
+
+# 下载官方发布包到内核同目录的候选文件：/tmp 可能禁止执行，且同目录 mv 是原子替换。
+xray_prepare_release_candidate() {
+    local tag="$1" asset archive
     asset=$(xray_release_asset "$XRAY_BIN") || return 1
+    ensure_unzip || return 1
+    archive="$RUN_DIR/$asset"
+    xray_download_verified "$tag" "$asset" "$archive" || return 1
+    XRAY_UPDATE_CANDIDATE="${XRAY_BIN%/*}/.3xuish-xray-candidate"
+    unzip -p "$archive" xray >"$XRAY_UPDATE_CANDIDATE" || { fail "发布包中没有 xray 程序；内核未改动。"; return 1; }
+    chmod 755 "$XRAY_UPDATE_CANDIDATE" || return 1
+    [[ "$(xray_installed_version "$XRAY_UPDATE_CANDIDATE")" == "${tag#v}" ]] || {
+        fail "新内核无法在本机运行或版本号不符；内核未改动。"; return 1;
+    }
+}
+
+# 校验候选内核、备份当前内核、替换并重启；新内核启动失败时自动换回原内核。
+xray_install_candidate() {
+    local current="$1" version="$2" mode="$3" runtime target backup before="" was_running=0
+    runtime="$XUI_INSTALL_DIR/bin/config.json"
+    if [[ -s "$runtime" ]]; then
+        if ! (cd "$XUI_INSTALL_DIR" && "$XRAY_UPDATE_CANDIDATE" run -test -c "$runtime") \
+            >"$RUN_DIR/xray-update-test.log" 2>&1; then
+            tail -n 20 "$RUN_DIR/xray-update-test.log" >&2 || true
+            fail "Xray ${version} 不接受当前节点配置，未更换内核。请先升级 3x-ui 面板或调整上方报错的配置后重试。"
+            return 1
+        fi
+        log_info "Xray ${version} 已通过当前节点配置校验。"
+    fi
+    target=$(readlink -f -- "$XRAY_BIN") || target="$XRAY_BIN"
+    if xray_binary_pid "$target" >/dev/null; then was_running=1; fi
+    before=$(xray_inbound_listeners "$runtime") || before=""
+    install -d -m 700 "$XUI_INFO_DIR/3xuish-xray-backup" || return 1
+    backup=$(xray_backup_file)
+    install -m 700 "$XRAY_BIN" "$backup" || { fail "无法备份原内核；内核未改动。"; return 1; }
+    mv -f -- "$XRAY_UPDATE_CANDIDATE" "$XRAY_BIN" || { fail "替换内核文件失败；原内核仍在使用。"; return 1; }
+    XRAY_UPDATE_CANDIDATE=""
+    log_info "已替换内核文件（旧内核备份：${backup}），正在重启 ${XUI_SERVICE}，节点连接会短暂中断..."
+
+    if xray_restart_panel && xray_wait_healthy "$target" "$before" "$runtime"; then
+        log_info "Xray 内核已切换：${current:-未知} → ${version}，原有入站监听均已恢复。"
+        [[ "$mode" == --auto ]] || print_mptcp_hint
+        return 0
+    fi
+    log_warn "新内核启动后未通过运行检查，正在恢复原内核 ${current:-（版本未知）}..."
+    if xray_install_file "$backup" "$XRAY_BIN" && xray_restart_panel &&
+       { [[ "$was_running" == 0 ]] || xray_wait_healthy "$target" "$before" "$runtime"; }; then
+        fail "已恢复原内核 ${current:-（版本未知）}，本次未切换。请查看 journalctl -u ${XUI_SERVICE} -n 100 --no-pager 排查。"
+    else
+        fail "恢复原内核后仍未确认运行。请执行：install -m 755 '${backup}' '${XRAY_BIN}' 后重启 ${XUI_SERVICE}，并检查面板日志。"
+    fi
+    return 1
+}
+
+update_xray_core() {
+    local mode="${1:-}" tag latest current
+    if [[ "$mode" == --auto ]]; then
+        RED='' GREEN='' YELLOW='' CYAN='' PLAIN=''
+        printf '\n[%s] Xray 自动更新检查\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        if [[ ! -d "$XUI_INSTALL_DIR/bin" ]]; then
+            log_info "未检测到 3x-ui 程序目录 ${XUI_INSTALL_DIR}/bin，本次跳过。"
+            return 0
+        fi
+    fi
+    xray_require_binary || return 1
     current=$(xray_installed_version "$XRAY_BIN") || current=""
     tag=$(xray_latest_release) || return 1
     latest="${tag#v}"
@@ -2750,51 +2808,62 @@ update_xray_core() {
         [[ "$mode" == --auto ]] || print_mptcp_hint
         return 0
     fi
+    xray_prepare_release_candidate "$tag" || return 1
+    xray_install_candidate "$current" "$latest" "$mode"
+}
 
-    ensure_unzip || return 1
-    archive="$RUN_DIR/$asset"
-    xray_download_verified "$tag" "$asset" "$archive" || return 1
-    # 候选文件放在内核同目录：/tmp 可能禁止执行，且同目录 mv 是原子替换。
-    XRAY_UPDATE_CANDIDATE="${XRAY_BIN%/*}/.3xuish-xray-candidate"
-    unzip -p "$archive" xray >"$XRAY_UPDATE_CANDIDATE" || { fail "发布包中没有 xray 程序；内核未改动。"; return 1; }
-    chmod 755 "$XRAY_UPDATE_CANDIDATE" || return 1
-    [[ "$(xray_installed_version "$XRAY_UPDATE_CANDIDATE")" == "$latest" ]] || {
-        fail "新内核无法在本机运行或版本号不符；内核未改动。"; return 1;
-    }
-    runtime="$XUI_INSTALL_DIR/bin/config.json"
-    if [[ -s "$runtime" ]]; then
-        if ! (cd "$XUI_INSTALL_DIR" && "$XRAY_UPDATE_CANDIDATE" run -test -c "$runtime") \
-            >"$RUN_DIR/xray-update-test.log" 2>&1; then
-            tail -n 20 "$RUN_DIR/xray-update-test.log" >&2 || true
-            fail "新版 Xray 不接受当前节点配置，未更换内核。请先升级 3x-ui 面板或调整上方报错的配置后重试。"
-            return 1
-        fi
-        log_info "新内核已通过当前节点配置校验。"
+# 指定版本或回滚后，每日自动更新仍会升级到最新稳定版；提醒用户按需关闭。
+xray_pin_notice() {
+    local version="$1" tag
+    xray_auto_update_enabled || return 0
+    tag=$(xray_latest_release 2>/dev/null) || tag=""
+    if [[ -z "$tag" ]] || xray_version_newer "${tag#v}" "$version"; then
+        log_warn "每日自动更新已开启，下次检查会升级到最新稳定版；要停留在 ${version}，请关闭自动更新（--disable-xray-auto-update 或菜单 14）。"
     fi
+}
 
-    target=$(readlink -f -- "$XRAY_BIN") || target="$XRAY_BIN"
-    if xray_binary_pid "$target" >/dev/null; then was_running=1; fi
-    before=$(xray_inbound_listeners "$runtime") || before=""
-    install -d -m 700 "$XUI_INFO_DIR/3xuish-xray-backup" || return 1
-    backup="$XUI_INFO_DIR/3xuish-xray-backup/${XRAY_BIN##*/}.previous"
-    install -m 700 "$XRAY_BIN" "$backup" || { fail "无法备份原内核；内核未改动。"; return 1; }
-    mv -f -- "$XRAY_UPDATE_CANDIDATE" "$XRAY_BIN" || { fail "替换内核文件失败；原内核仍在使用。"; return 1; }
-    XRAY_UPDATE_CANDIDATE=""
-    log_info "已替换内核文件（旧内核备份：${backup}），正在重启 ${XUI_SERVICE}，节点连接会短暂中断..."
-
-    if xray_restart_panel && xray_wait_healthy "$target" "$before" "$runtime"; then
-        log_info "Xray 内核已更新：${current:-未知} → ${latest}，原有入站监听均已恢复。"
-        [[ "$mode" == --auto ]] || print_mptcp_hint
+switch_xray_core() {
+    local tag current response
+    [[ "${1:-}" =~ ^v?([0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4})$ ]] || {
+        fail "版本号格式应为 26.10.21（可带 v 前缀）。"; return 1;
+    }
+    tag="v${BASH_REMATCH[1]}"
+    xray_require_binary || return 1
+    current=$(xray_installed_version "$XRAY_BIN") || current=""
+    if [[ "$current" == "${tag#v}" ]]; then
+        log_info "当前 Xray 内核已是 ${current}，无需切换。"
         return 0
     fi
-    log_warn "新内核启动后未通过运行检查，正在恢复原内核 ${current:-（版本未知）}..."
-    if xray_install_file "$backup" "$XRAY_BIN" && xray_restart_panel &&
-       { [[ "$was_running" == 0 ]] || xray_wait_healthy "$target" "$before" "$runtime"; }; then
-        fail "已恢复原内核 ${current:-（版本未知）}，本次未更新。请查看 journalctl -u ${XUI_SERVICE} -n 100 --no-pager 排查。"
-    else
-        fail "恢复原内核后仍未确认运行。请执行：install -m 755 '${backup}' '${XRAY_BIN}' 后重启 ${XUI_SERVICE}，并检查面板日志。"
+    response=$(curl -q -fsSL --connect-timeout 10 --max-time 30 --retry 2 \
+        -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/XTLS/Xray-core/releases/tags/$tag") || {
+        fail "官方发布中没有 Xray ${tag}，或暂时无法访问 GitHub；内核未改动。"; return 1;
+    }
+    if jq -e '.prerelease == true' >/dev/null <<<"$response"; then
+        log_warn "Xray ${tag} 是预发布版本，可能不稳定。"
     fi
-    return 1
+    log_info "当前 Xray 内核：${current:-无法识别}；目标版本：${tag#v}"
+    xray_prepare_release_candidate "$tag" || return 1
+    xray_install_candidate "$current" "${tag#v}" manual || return 1
+    xray_pin_notice "${tag#v}"
+}
+
+# 用上次更新前的备份替换当前内核；当前内核成为新的备份，再执行一次即可换回。
+rollback_xray_core() {
+    local backup previous current
+    xray_require_binary || return 1
+    backup=$(xray_backup_file)
+    [[ -f "$backup" ]] || { fail "没有可回滚的旧内核：${backup}（只有通过本脚本更新过才会有备份）。"; return 1; }
+    previous=$(xray_installed_version "$backup") || { fail "备份内核无法运行：${backup}"; return 1; }
+    current=$(xray_installed_version "$XRAY_BIN") || current=""
+    if [[ "$previous" == "$current" ]]; then
+        log_info "备份内核与当前内核同为 ${current}，无需回滚。"
+        return 0
+    fi
+    log_info "当前 Xray 内核：${current:-无法识别}；回滚到备份版本：${previous}"
+    XRAY_UPDATE_CANDIDATE="${XRAY_BIN%/*}/.3xuish-xray-candidate"
+    install -m 755 "$backup" "$XRAY_UPDATE_CANDIDATE" || { fail "无法读取备份内核。"; return 1; }
+    xray_install_candidate "$current" "$previous" manual || return 1
+    xray_pin_notice "$previous"
 }
 
 xray_auto_update_enabled() {
@@ -3044,6 +3113,8 @@ print_usage() {
   --hy2-hop 范围|off|status  Hy2 端口跳跃，例如 --hy2-hop 20000-50000
   --argo quick|fixed|off|status  Cloudflare Argo 隧道（临时或固定；固定可用 ARGO_TOKEN/ARGO_DOMAIN）
   --update-xray              更新 Xray 内核到官方最新稳定版（启动失败自动恢复）
+  --switch-xray 版本号        切换 Xray 内核到指定官方版本，例如 26.10.21
+  --rollback-xray            回滚到上一次更新前的 Xray 内核
   --enable-xray-auto-update  开启每日自动检查并更新 Xray 内核
   --disable-xray-auto-update 关闭 Xray 自动更新
   --help                     显示帮助
@@ -3139,9 +3210,11 @@ interactive_menu() {
             '  16) 查看订阅、节点链接与二维码' \
             '  17) Hy2 端口跳跃（开启、修改或关闭）' \
             '  18) Argo 隧道（Cloudflare，IP 被封时备用）' \
+            '  19) 切换 Xray 内核到指定版本' \
+            '  20) 回滚到上一次更新前的 Xray 内核' \
             '  0) 退出'
         choice=""
-        if ! menu_read_choice choice '请选择 [0-18]：'; then
+        if ! menu_read_choice choice '请选择 [0-20]：'; then
             printf '\n输入已结束，退出菜单。\n'
             return 0
         fi
@@ -3193,8 +3266,14 @@ interactive_menu() {
                     *) log_warn "请输入 1–3。" ;;
                 esac
                 ;;
+            19)
+                domain=""
+                if ! menu_read_choice domain 'Xray 版本号（如 26.10.21；留空取消）：'; then return 0; fi
+                if [[ -n "$domain" ]]; then menu_run_action --switch-xray "$domain"; fi
+                ;;
+            20) menu_run_action --rollback-xray ;;
             '') ;;
-            *) log_warn "请输入 0–18。" ;;
+            *) log_warn "请输入 0–20。" ;;
         esac
     done
 }
@@ -3205,7 +3284,9 @@ main() {
         --help|-h) [[ $# -eq 1 ]] || { fail "帮助选项不能附带其他参数。"; return 1; }; print_usage; return 0 ;;
         --menu|--install|--add-nodes|--reinstall|--reinstall-status|--uninstall|--uninstall-status)
             [[ $# -eq 1 ]] || { fail "${action} 不接受额外参数。"; return 1; } ;;
-        --enable-xray-auto-update|--disable-xray-auto-update|--enable-subscription|--show-links)
+        --switch-xray)
+            [[ $# -eq 2 ]] || { fail "--switch-xray 需要一个版本号，例如 26.10.21。"; return 1; } ;;
+        --enable-xray-auto-update|--disable-xray-auto-update|--enable-subscription|--show-links|--rollback-xray)
             [[ $# -eq 1 ]] || { fail "${action} 不接受额外参数。"; return 1; } ;;
         --switch-domain)
             [[ $# -le 2 ]] || { fail "--switch-domain 只接受一个域名。"; return 1; } ;;
@@ -3237,6 +3318,8 @@ main() {
         --add-nodes) acquire_maintenance_lock; add_nodes_to_existing ;;
         --switch-domain) acquire_maintenance_lock; switch_existing_to_domain "${2:-}" ;;
         --update-xray) acquire_maintenance_lock; update_xray_core "${2:-}" ;;
+        --switch-xray) acquire_maintenance_lock; switch_xray_core "$2" ;;
+        --rollback-xray) acquire_maintenance_lock; rollback_xray_core ;;
         --enable-subscription) acquire_maintenance_lock; enable_subscription_command ;;
         --show-links) show_links_command ;;
         --hy2-hop)
