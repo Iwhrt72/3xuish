@@ -92,6 +92,41 @@ valid_ipv4() {
     for octet in "${parts[@]}"; do ((10#$octet <= 255)) || return 1; done
 }
 
+# 只接受标准文本形式的 IPv6（不含区域 ID 和内嵌 IPv4），用于服务器地址和证书。
+valid_ipv6() {
+    local address="${1,,}" part group count=0 groups=()
+    [[ "$address" =~ ^[0-9a-f:]{2,39}$ && "$address" == *:* ]] || return 1
+    local head="$address" tail=""
+    if [[ "$address" == *::* ]]; then
+        head="${address%%::*}" tail="${address#*::}"
+        [[ "$tail" != *::* ]] || return 1
+    fi
+    for part in "$head" "$tail"; do
+        [[ -n "$part" ]] || continue
+        [[ "$part" != :* && "$part" != *: ]] || return 1
+        IFS=: read -r -a groups <<<"$part"
+        for group in "${groups[@]}"; do
+            [[ "$group" =~ ^[0-9a-f]{1,4}$ ]] || return 1
+            count=$((count + 1))
+        done
+    done
+    if [[ "$address" == *::* ]]; then ((count <= 7)); else ((count == 8)); fi
+}
+
+valid_ip() { valid_ipv4 "$1" || valid_ipv6 "$1"; }
+
+# 纯 IPv6 服务器访问 GitHub（不支持 IPv6）需要 NAT64 或 WARP；下载失败时附上说明。
+ipv6_github_hint() {
+    if valid_ipv6 "${SERVER_IP:-}" || ! ip -4 route show default 2>/dev/null | grep -q .; then
+        printf '%s' "本机没有 IPv4 出口，而 GitHub 不支持 IPv6：请先配置 NAT64/DNS64 或安装 WARP 获得 IPv4 出口后重试。"
+    fi
+}
+
+check_github_reachable() {
+    curl -q -fsS -o /dev/null --connect-timeout 8 --max-time 20 https://github.com && return 0
+    fail "无法访问 GitHub，未开始安装。$(ipv6_github_hint)"
+}
+
 valid_domain() {
     local domain="$1" label
     [[ ${#domain} -le 253 && "$domain" == *.* && "$domain" != *..* ]] || return 1
@@ -237,7 +272,8 @@ install_qrencode_optional() {
     return 0
 }
 
-# 4. 获取服务器公网 IPv4 地址
+# 4. 获取服务器公网地址：优先 IPv4；没有 IPv4 时使用 IPv6（纯 IPv6 服务器）。
+# 双栈服务器要用 IPv6 部署时，设置 XUI_SERVER_IP 为 IPv6 地址。
 detect_server_ip() {
     local urls=(
         "https://api4.ipify.org"
@@ -245,22 +281,49 @@ detect_server_ip() {
         "https://v4.api.ipinfo.io/ip"
         "https://4.ident.me"
     )
+    local urls6=(
+        "https://api6.ipify.org"
+        "https://ipv6.icanhazip.com"
+        "https://v6.ident.me"
+    )
+    local u ip
     SERVER_IP="${XUI_SERVER_IP:-}"
     if [[ -z "$SERVER_IP" ]]; then
         for u in "${urls[@]}"; do
-            local ip
             ip=$(curl -fsS4m 4 "$u" | tr -d '[:space:]') || continue
-            if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            if valid_ipv4 "$ip"; then
                 SERVER_IP="$ip"
                 break
             fi
         done
     fi
     if [[ -z "$SERVER_IP" ]]; then
-        prompt_read "未能自动检测到公网 IPv4，请手动输入服务器 IPv4 地址: " SERVER_IP
+        for u in "${urls6[@]}"; do
+            ip=$(curl -fsS6m 4 "$u" | tr -d '[:space:]') || continue
+            if valid_ipv6 "$ip"; then
+                SERVER_IP="$ip"
+                log_info "未检测到公网 IPv4，将使用 IPv6 地址部署。"
+                break
+            fi
+        done
     fi
-    valid_ipv4 "$SERVER_IP" || { fail "服务器 IPv4 地址无效。"; return 1; }
-    log_info "检测到服务器公网 IPv4: ${CYAN}${SERVER_IP}${PLAIN}"
+    if [[ -z "$SERVER_IP" ]]; then
+        prompt_read "未能自动检测到公网 IP，请手动输入服务器 IPv4 或 IPv6 地址: " SERVER_IP
+    fi
+    SERVER_IP="${SERVER_IP#[}"; SERVER_IP="${SERVER_IP%]}"
+    if valid_ipv4 "$SERVER_IP"; then
+        log_info "检测到服务器公网 IPv4: ${CYAN}${SERVER_IP}${PLAIN}"
+    elif valid_ipv6 "$SERVER_IP"; then
+        SERVER_IP="${SERVER_IP,,}"
+        log_info "检测到服务器公网 IPv6: ${CYAN}${SERVER_IP}${PLAIN}"
+    else
+        fail "服务器 IP 地址无效。"; return 1
+    fi
+}
+
+# acme.sh 的独立验证服务默认只监听 IPv4；IPv6 地址需要 --listen-v6。
+acme_listen_args() {
+    if valid_ipv6 "${SERVER_IP:-}"; then printf '%s\n' --listen-v6; fi
 }
 
 # 5. 释放 80 端口并确保 acme.sh 就绪
@@ -274,7 +337,7 @@ validate_certificate_pair() {
     openssl x509 -in "$cert" -checkend 0 -noout >/dev/null 2>&1 || {
         fail "证书已过期或无法读取，未采用该证书。"; return 1;
     }
-    if valid_ipv4 "$host"; then
+    if valid_ip "$host"; then
         match_option=-verify_ip
     elif valid_domain "$host"; then
         match_option=-verify_hostname
@@ -325,9 +388,11 @@ issue_ip_cert() {
     mkdir -p "$CERT_DIR" || return 1
 
     log_info "正在向 Let's Encrypt 申请 IP (${SERVER_IP}) SSL 证书 (shortlived 模式，自动续期)..."
+    local listen=()
+    mapfile -t listen < <(acme_listen_args)
     run_acme --issue \
         -d "${SERVER_IP}" \
-        --standalone \
+        --standalone ${listen[@]+"${listen[@]}"} \
         --server letsencrypt \
         --certificate-profile shortlived \
         --days 6 \
@@ -369,9 +434,11 @@ issue_domain_cert() {
     mkdir -p "$CERT_DIR" || return 1
 
     log_info "正在向 Let's Encrypt 申请域名 (${domain}) SSL 证书 (90天有效期，自动续期)..."
+    local listen=()
+    mapfile -t listen < <(acme_listen_args)
     run_acme --issue \
         -d "${domain}" \
-        --standalone \
+        --standalone ${listen[@]+"${listen[@]}"} \
         --server letsencrypt \
         --httpport 80 \
         --force || { fail "域名证书签发失败，未使用旧文件继续部署。"; return 1; }
@@ -505,6 +572,8 @@ switch_existing_to_domain() (
     if [[ -s "$profile_file" ]]; then
         NODE_PROFILES=$(jq -c --arg address "$CERT_HOST" --arg cert "$CERT_FILE" --arg key "$KEY_FILE" '
             map(.clientOutbound.settings.address = $address |
+                if .clientOutbound.streamSettings.network == "xhttp" then
+                    .clientOutbound.streamSettings.xhttpSettings.host = "" else . end |
                 if .security == "tls" then
                     .clientOutbound.streamSettings.tlsSettings.serverName = $address |
                     .payload.streamSettings |= (fromjson |
@@ -527,8 +596,9 @@ switch_existing_to_domain() (
         # 从已保存的说明恢复面板信息；不要执行磁盘上的 shell 环境文件。
         PANEL_USER="${XUI_USERNAME:-$(sed -n 's/^管理员账号：//p' "$XUI_INFO_DIR/3x-ui-nodes-info.txt" | head -n 1)}"
         PANEL_PASS="${XUI_PASSWORD:-$(sed -n 's/^管理员密码：//p' "$XUI_INFO_DIR/3x-ui-nodes-info.txt" | head -n 1)}"
-        PANEL_PORT="${XUI_PANEL_PORT:-$(sed -nE 's#^访问地址：https?://[^:]+:([0-9]+)/.*#\1#p' "$XUI_INFO_DIR/3x-ui-nodes-info.txt" | head -n 1)}"
-        WEB_BASE_PATH="${XUI_WEB_BASE_PATH:-$(sed -nE 's#^访问地址：https?://[^:]+:[0-9]+/([^/]+)/.*#\1#p' "$XUI_INFO_DIR/3x-ui-nodes-info.txt" | head -n 1)}"
+        # 主机部分可能是带方括号的 IPv6 地址。
+        PANEL_PORT="${XUI_PANEL_PORT:-$(sed -nE 's#^访问地址：https?://(\[[^]]*\]|[^:/]+):([0-9]+)/.*#\2#p' "$XUI_INFO_DIR/3x-ui-nodes-info.txt" | head -n 1)}"
+        WEB_BASE_PATH="${XUI_WEB_BASE_PATH:-$(sed -nE 's#^访问地址：https?://(\[[^]]*\]|[^:/]+):[0-9]+/([^/]+)/.*#\2#p' "$XUI_INFO_DIR/3x-ui-nodes-info.txt" | head -n 1)}"
         WEB_BASE_PATH="${WEB_BASE_PATH#/}"; WEB_BASE_PATH="${WEB_BASE_PATH%/}"
         valid_port "$PANEL_PORT" && [[ "$WEB_BASE_PATH" =~ ^[A-Za-z0-9_-]+$ ]] || { fail "无法恢复面板地址信息，已取消域名切换。"; return 1; }
         RAW_PORT=$(jq -r '.[] | select(.key == "raw") | .port' <<<"$NODE_PROFILES")
@@ -836,6 +906,10 @@ prepare_node_profiles() {
             tlsSettings: tls_server(["h2", "http/1.1"]), sockopt: tcp_options
         };
         def xhttp_options: {path: $path, host: "", mode: "auto"};
+        # Xray 的 XHTTP 客户端在 host 为空、地址是 IPv6 字面量时会拼出 https://::1/ 而失败，
+        # 所以 IPv6 部署的客户端显式带上 [地址]；服务端 host 保持为空。
+        def xhttp_client_options:
+            xhttp_options + {host: (if ($address | contains(":")) then "[" + $address + "]" else "" end)};
         def xhttp_stream:
             {network: "xhttp", security: (if $xhttp_tls_mode == "2" then "none" else "tls" end),
              xhttpSettings: xhttp_options, sockopt: tcp_options}
@@ -906,7 +980,7 @@ prepare_node_profiles() {
                 null;
                 vless_client($xhttp_uuid; $xhttp_port; $enc;
                     {network: "xhttp", security: (if $xhttp_tls_mode == "2" then "none" else "tls" end),
-                     xhttpSettings: xhttp_options}
+                     xhttpSettings: xhttp_client_options}
                     + (if $xhttp_tls_mode == "2" then {} else
                           {tlsSettings: tls_client(["h2", "http/1.1"])} end));
                 $xhttp_uuid)
@@ -1140,7 +1214,7 @@ write_node_files() {
         printf '  3x-ui 四节点部署完成：连接信息与使用说明\n'
         printf '============================================================\n'
         printf '\n[面板]\n'
-        printf '访问地址：%s://%s:%s%s/\n' "${PANEL_API_SCHEME:-https}" "$CERT_HOST" "$PANEL_PORT" "${WEB_BASE_PATH:+/$WEB_BASE_PATH}"
+        printf '访问地址：%s://%s:%s%s/\n' "${PANEL_API_SCHEME:-https}" "$(url_host "$CERT_HOST")" "$PANEL_PORT" "${WEB_BASE_PATH:+/$WEB_BASE_PATH}"
         printf '管理员账号：%s\n管理员密码：%s\n' "$PANEL_USER" "$PANEL_PASS"
         printf '证书文件：%s\n私钥文件：%s\n' "$CERT_FILE" "$KEY_FILE"
         load_subscription_urls "$profiles_file"
@@ -1288,9 +1362,14 @@ profiles_sub_id() {
         select(test("^[A-Za-z0-9_-]{8,64}$"))' "$1" 2>/dev/null
 }
 
-# 订阅承载节点：已有标记优先，否则选主用节点。
+# 订阅承载节点：已有标记优先，否则选主用节点。承载节点的链接由面板生成；IPv6 地址下
+# 面板生成的 XHTTP 链接不带 host，Xray 客户端无法连接，因此这时改用 Hy2 承载。
 subscription_owner_key() {
-    jq -er '([.[] | select(.subscriptionOwner == true)][0] // [.[] | select(.primary == true)][0] // .[0]).key' "$1"
+    jq -er '
+        def v6: (.clientOutbound.settings.address // "") | contains(":");
+        ([.[] | select(.subscriptionOwner == true)][0]
+         // ([.[] | select(.primary == true and ((.key == "xhttp" and v6) | not))][0])
+         // ([.[] | select(.key == "hy2")][0]) // .[0]).key' "$1"
 }
 
 # 订阅外部链接：除承载节点外的全部节点，以及已开启的 Argo 节点。
@@ -1846,7 +1925,7 @@ install_cloudflared() {
     asset=$(cloudflared_asset) || return 1
     release=$(curl -q -fsSL --connect-timeout 10 --max-time 30 --retry 2 \
         -H 'Accept: application/vnd.github+json' "$ARGO_RELEASE_API") || {
-        fail "无法从 GitHub 获取 cloudflared 版本信息。"; return 1;
+        fail "无法从 GitHub 获取 cloudflared 版本信息。$(ipv6_github_hint)"; return 1;
     }
     tag=$(jq -er 'select(.draft == false and .prerelease == false) | .tag_name' <<<"$release") || {
         fail "GitHub 未返回 cloudflared 稳定版本。"; return 1;
@@ -2606,7 +2685,7 @@ xray_latest_release() {
     local response tag
     response=$(curl -q -fsSL --connect-timeout 10 --max-time 30 --retry 2 \
         -H 'Accept: application/vnd.github+json' "$XRAY_RELEASE_API") || {
-        fail "无法从 GitHub 获取 Xray 最新版本，请检查服务器到 api.github.com 的连接；内核未改动。"; return 1;
+        fail "无法从 GitHub 获取 Xray 最新版本，请检查服务器到 api.github.com 的连接；内核未改动。$(ipv6_github_hint)"; return 1;
     }
     tag=$(jq -er 'select(.draft == false and .prerelease == false) | .tag_name' <<<"$response") || {
         fail "GitHub 未返回可用的 Xray 稳定版本；内核未改动。"; return 1;
@@ -2946,6 +3025,7 @@ fresh_install() {
     acquire_maintenance_lock
     install_deps
     detect_server_ip
+    check_github_reachable
     init_config
     check_ports_available
     verify_reality_target
