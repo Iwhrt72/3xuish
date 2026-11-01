@@ -736,7 +736,9 @@ profile_share_link() {
         if $out.protocol == "hysteria" then
             "hysteria2://" + ($stream.hysteriaSettings.auth | encoded) + "@" + $address + ":" + $port
             + "/?sni=" + ($stream.tlsSettings.serverName | encoded)
-            + "&alpn=h3&insecure=0#" + $remark
+            + "&alpn=h3&insecure=0"
+            + (if ($profile.hopPorts // "") != "" then "&mport=" + ($profile.hopPorts | encoded) else "" end)
+            + "#" + $remark
         elif $out.protocol == "vless" then
             "vless://" + $settings.id + "@" + $address + ":" + $port
             + "?type=" + ($stream.network | encoded)
@@ -1550,6 +1552,335 @@ print_subscription_block() {
     esac
 }
 
+# 17. Hy2 端口跳跃：把一段 UDP 端口重定向到 Hy2 端口。Xray 只监听原端口；
+# 范围写入入站的 quicParams.udpHop，面板据此在分享链接和订阅中公布（mport / ports）。
+HY2_HOP_CONF="/etc/3xuish/hy2-hop.conf"
+HY2_HOP_SCRIPT="/usr/local/lib/3xuish/hy2-hop.sh"
+HY2_HOP_SERVICE="3xuish-hy2-hop"
+
+hy2_hop_has_systemd() { command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; }
+hy2_hop_has_openrc() { command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; }
+
+# 开机时由服务调用的 POSIX 脚本；只读取数字配置，不执行配置文件内容。
+write_hy2_hop_script() {
+    install -d -m 755 "${HY2_HOP_SCRIPT%/*}" || return 1
+    cat >"$HY2_HOP_SCRIPT.tmp" <<'HOPSCRIPT' || return 1
+#!/bin/sh
+# 由 3xuish 生成：把 UDP 端口范围重定向到 Hy2 端口。配置：/etc/3xuish/hy2-hop.conf
+set -u
+CONF=/etc/3xuish/hy2-hop.conf
+TABLE=hy2hop_3xuish
+COMMENT=3xuish-hy2-hop
+value() { sed -n "s/^$1=\([0-9a-z]\{1,8\}\)\$/\1/p" "$CONF" | head -n 1; }
+read_conf() {
+    [ -f "$CONF" ] || { echo "missing $CONF" >&2; exit 1; }
+    START=$(value HOP_START); END=$(value HOP_END); TARGET=$(value HOP_TARGET); BACKEND=$(value HOP_BACKEND)
+    case "$START$END$TARGET" in ''|*[!0-9]*) echo "invalid $CONF" >&2; exit 1 ;; esac
+    case "$BACKEND" in nft|iptables) ;; *) echo "invalid backend in $CONF" >&2; exit 1 ;; esac
+}
+remove_rules() {
+    if command -v nft >/dev/null 2>&1; then
+        nft delete table ip "$TABLE" 2>/dev/null
+        nft delete table ip6 "$TABLE" 2>/dev/null
+    fi
+    for cmd in iptables ip6tables; do
+        command -v "$cmd" >/dev/null 2>&1 || continue
+        "$cmd" -t nat -S PREROUTING 2>/dev/null | grep -F -- "$COMMENT" | sed -e 's/^-A /-D /' -e 's/"//g' |
+            while read -r rule; do
+                # shellcheck disable=SC2086
+                "$cmd" -t nat $rule 2>/dev/null
+            done
+    done
+    return 0
+}
+apply_rules() {
+    read_conf
+    remove_rules
+    if [ "$BACKEND" = nft ]; then
+        for fam in ip ip6; do
+            if ! printf 'table %s %s {\n chain prerouting {\n  type nat hook prerouting priority -100; policy accept;\n  udp dport %s-%s counter redirect to :%s\n }\n}\n' \
+                "$fam" "$TABLE" "$START" "$END" "$TARGET" | nft -f -; then
+                [ "$fam" = ip6 ] || exit 1
+                echo "IPv6 redirect not applied" >&2
+            fi
+        done
+    else
+        iptables -t nat -A PREROUTING -p udp --dport "$START:$END" -m comment --comment "$COMMENT" \
+            -j REDIRECT --to-ports "$TARGET" || exit 1
+        if command -v ip6tables >/dev/null 2>&1; then
+            ip6tables -t nat -A PREROUTING -p udp --dport "$START:$END" -m comment --comment "$COMMENT" \
+                -j REDIRECT --to-ports "$TARGET" 2>/dev/null || echo "IPv6 redirect not applied" >&2
+        fi
+    fi
+}
+active() {
+    read_conf
+    if [ "$BACKEND" = nft ]; then
+        nft list table ip "$TABLE" 2>/dev/null | grep -q "dport $START-$END .*redirect to :$TARGET"
+    else
+        iptables -t nat -S PREROUTING 2>/dev/null | grep -F -- "$COMMENT" | grep -q -- "--dport $START:$END .*--to-ports $TARGET"
+    fi
+}
+case "${1:-}" in
+    apply) apply_rules ;;
+    remove) remove_rules ;;
+    active) active ;;
+    *) echo "usage: $0 apply|remove|active" >&2; exit 2 ;;
+esac
+HOPSCRIPT
+    chmod 755 "$HY2_HOP_SCRIPT.tmp" && mv -f -- "$HY2_HOP_SCRIPT.tmp" "$HY2_HOP_SCRIPT"
+}
+
+install_hy2_hop_service() {
+    if hy2_hop_has_systemd; then
+        cat >"/etc/systemd/system/$HY2_HOP_SERVICE.service" <<UNIT || return 1
+[Unit]
+Description=3xuish Hy2 UDP port hopping
+Wants=network-pre.target
+After=network-pre.target nftables.service firewalld.service ufw.service netfilter-persistent.service iptables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh $HY2_HOP_SCRIPT apply
+ExecStop=/bin/sh $HY2_HOP_SCRIPT remove
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+        systemctl daemon-reload || return 1
+        systemctl enable "$HY2_HOP_SERVICE" >/dev/null 2>&1 || return 1
+        systemctl restart "$HY2_HOP_SERVICE" || return 1
+    elif hy2_hop_has_openrc; then
+        cat >"/etc/init.d/$HY2_HOP_SERVICE" <<RC || return 1
+#!/sbin/openrc-run
+description="3xuish Hy2 UDP port hopping"
+depend() {
+    need net
+    after firewall iptables ip6tables nftables
+}
+start() {
+    ebegin "Applying Hy2 port hopping"
+    /bin/sh $HY2_HOP_SCRIPT apply
+    eend \$?
+}
+stop() {
+    ebegin "Removing Hy2 port hopping"
+    /bin/sh $HY2_HOP_SCRIPT remove
+    eend \$?
+}
+RC
+        chmod 755 "/etc/init.d/$HY2_HOP_SERVICE" || return 1
+        rc-update add "$HY2_HOP_SERVICE" default >/dev/null 2>&1 || return 1
+        rc-service "$HY2_HOP_SERVICE" restart >/dev/null 2>&1 || return 1
+    else
+        log_warn "未检测到 systemd 或 OpenRC：规则已立即生效，但重启后不会自动恢复。"
+        /bin/sh "$HY2_HOP_SCRIPT" apply || return 1
+    fi
+}
+
+remove_hy2_hop_service() {
+    if hy2_hop_has_systemd && [[ -f "/etc/systemd/system/$HY2_HOP_SERVICE.service" ]]; then
+        systemctl disable --now "$HY2_HOP_SERVICE" >/dev/null 2>&1 || true
+        rm -f -- "/etc/systemd/system/$HY2_HOP_SERVICE.service"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    elif [[ -f "/etc/init.d/$HY2_HOP_SERVICE" ]]; then
+        rc-service "$HY2_HOP_SERVICE" stop >/dev/null 2>&1 || true
+        rc-update del "$HY2_HOP_SERVICE" default >/dev/null 2>&1 || true
+        rm -f -- "/etc/init.d/$HY2_HOP_SERVICE"
+    fi
+    if [[ -f "$HY2_HOP_SCRIPT" ]]; then /bin/sh "$HY2_HOP_SCRIPT" remove || true; fi
+}
+
+ensure_nat_backend() {
+    if command -v nft >/dev/null 2>&1 && nft list tables >/dev/null 2>&1; then
+        HY2_HOP_BACKEND=nft; return 0
+    fi
+    if command -v iptables >/dev/null 2>&1 && iptables -t nat -S PREROUTING >/dev/null 2>&1; then
+        HY2_HOP_BACKEND=iptables; return 0
+    fi
+    log_info "正在安装 nftables，用于端口重定向..."
+    case "${RELEASE:-}" in
+        centos | rhel | almalinux | rocky | fedora | amzn | ol)
+            if command -v dnf >/dev/null 2>&1; then dnf install -y -q nftables; else yum install -y -q nftables; fi ;;
+        alpine) apk add --no-cache nftables ;;
+        arch | manjaro) pacman -S --noconfirm --needed nftables ;;
+        *) apt-get update -y -q && apt-get install -y -q nftables ;;
+    esac || { fail "nftables 安装失败，未开启端口跳跃。"; return 1; }
+    nft list tables >/dev/null 2>&1 || { fail "nftables 不可用（可能缺少内核模块或权限），未开启端口跳跃。"; return 1; }
+    HY2_HOP_BACKEND=nft
+}
+
+hy2_hop_current_range() {
+    local start end
+    [[ -f "$HY2_HOP_CONF" ]] || return 1
+    start=$(sed -n 's/^HOP_START=\([0-9]\{1,5\}\)$/\1/p' "$HY2_HOP_CONF")
+    end=$(sed -n 's/^HOP_END=\([0-9]\{1,5\}\)$/\1/p' "$HY2_HOP_CONF")
+    [[ -n "$start" && -n "$end" ]] || return 1
+    printf '%s-%s\n' "$start" "$end"
+}
+
+# 范围内不能有其他 UDP 服务，否则会被重定向到 Hy2。
+check_hop_range_free() {
+    local start="$1" end="$2" hy2_port="$3" hy2_tag="$4" port count
+    while read -r port; do
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        if ((port >= start && port <= end && port != hy2_port)); then
+            fail "UDP/${port} 已有程序监听，位于跳跃范围 ${start}-${end} 内；请换一个范围。"; return 1
+        fi
+    # 只查询 UDP 时 ss 不输出 Netid 列，本地地址在第 4 列。
+    done < <(ss -H -lnu | awk '{n = split($4, a, ":"); print a[n]}' | sort -un)
+    count=$(sqlite3 -readonly "$XUI_DB_PATH" "SELECT count(*) FROM inbounds WHERE tag<>'$hy2_tag' AND port BETWEEN $start AND $end AND (protocol IN ('hysteria','wireguard','tuic','amneziawg') OR json_extract(stream_settings,'$.network') IN ('kcp','quic'));") || return 1
+    [[ "$count" == 0 ]] || { fail "面板中有 ${count} 个 UDP 入站端口位于 ${start}-${end} 内；请换一个范围。"; return 1; }
+}
+
+hy2_inbound_id() {
+    local tag="$1" id
+    [[ "$tag" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    id=$(sqlite3 -readonly "$XUI_DB_PATH" "SELECT id FROM inbounds WHERE tag='$tag' AND protocol='hysteria';") || return 1
+    [[ "$id" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$id"
+}
+
+# ports 为空时删除 udpHop；返回新的 streamSettings 字符串写入 HY2_HOP_STREAM。
+update_hy2_inbound_hop() {
+    local id="$1" ports="$2" response inbound payload
+    response=$(api_request GET "/panel/api/inbounds/get/$id") || { fail "无法读取 Hy2 入站。"; return 1; }
+    inbound=$(jq -ce 'select(.success == true) | .obj | objects' <<<"$response") || { fail "面板未返回 Hy2 入站。"; return 1; }
+    # 新版面板返回对象，旧版返回 JSON 字符串；提交时统一为字符串。
+    payload=$(jq -c --arg ports "$ports" '
+        def as_object: if type == "string" then fromjson else . end;
+        def as_string: if type == "string" then . else tojson end;
+        del(.clientStats) | .settings |= as_string | .sniffing |= as_string |
+        .streamSettings |= (as_object |
+            if $ports == "" then
+                (if .finalmask.quicParams then .finalmask.quicParams |= del(.udpHop) else . end)
+            else .finalmask.quicParams.udpHop = {ports: $ports, interval: "5-10"} end | tojson)' <<<"$inbound") || return 1
+    response=$(api_request POST "/panel/api/inbounds/update/$id" "$payload") || { fail "更新 Hy2 入站时面板无响应。"; return 1; }
+    jq -e '.success == true' >/dev/null <<<"$response" || {
+        fail "面板拒绝更新 Hy2 入站：$(jq -r '.msg // "未知原因"' <<<"$response" 2>/dev/null)"; return 1;
+    }
+    HY2_HOP_STREAM=$(jq -r '.streamSettings' <<<"$payload")
+}
+
+wait_hy2_listening() {
+    local port="$1"
+    for _ in {1..20}; do
+        [[ "$(ss -H -lnup "sport = :${port}")" == *xray* ]] && return 0
+        sleep 1
+    done
+    fail "Hy2 UDP/${port} 未恢复监听。"
+}
+
+# 资料文件中的 Hy2 链接带上 mport；ports 为空表示关闭。
+apply_hy2_hop_profile() {
+    local ports="$1" profile link updated='[]'
+    NODE_PROFILES=$(jq -c --arg ports "$ports" --arg stream "$HY2_HOP_STREAM" '
+        map(if .key == "hy2" then
+            (if $ports == "" then del(.hopPorts) else .hopPorts = $ports end) | .payload.streamSettings = $stream
+        else . end)' <<<"$NODE_PROFILES") || return 1
+    while IFS= read -r profile; do
+        link=$(profile_share_link "$profile") || return 1
+        updated=$(jq -c --argjson item "$profile" --arg link "$link" '. + [$item + {link: $link}]' <<<"$updated") || return 1
+    done < <(jq -c '.[]' <<<"$NODE_PROFILES")
+    NODE_PROFILES="$updated"
+    printf '%s\n' "$NODE_PROFILES" >"$RUN_DIR/profiles.json"
+}
+
+# 重装/卸载不会处理这些独立服务；提前提示，避免留下指向旧端口的规则或隧道。
+print_extra_services_notice() {
+    local extras=()
+    if [[ -f "$HY2_HOP_CONF" ]]; then extras+=("Hy2 端口跳跃（菜单 17 选 off 关闭）"); fi
+    if [[ -f "$XUI_INFO_DIR/3x-ui-argo.json" ]]; then extras+=("Argo 隧道（菜单 18 关闭）"); fi
+    if xray_auto_update_enabled; then extras+=("Xray 每日自动更新（菜单 14 关闭）"); fi
+    ((${#extras[@]} > 0)) || return 0
+    printf '注意：以下功能独立于面板，此操作不会移除，建议先关闭：\n'
+    printf '  - %s\n' "${extras[@]}"
+}
+
+hy2_hop_command() {
+    local arg="${1:-}" profiles_file="$XUI_INFO_DIR/3x-ui-node-profiles.json" start end hy2_port hy2_tag id ports old_conf=""
+    case "$arg" in
+        status)
+            if ports=$(hy2_hop_current_range); then
+                if [[ -f "$HY2_HOP_SCRIPT" ]] && /bin/sh "$HY2_HOP_SCRIPT" active; then
+                    log_info "Hy2 端口跳跃已开启：UDP ${ports}，规则生效中。"
+                else
+                    log_warn "Hy2 端口跳跃已配置（UDP ${ports}），但当前未检测到重定向规则；重新运行 --hy2-hop ${ports} 可恢复。"
+                fi
+            else
+                log_info "Hy2 端口跳跃未开启。"
+            fi
+            return 0 ;;
+        off) ports="" ;;
+        *)
+            [[ "$arg" =~ ^([0-9]{4,5})[-:]([0-9]{4,5})$ ]] || {
+                fail "端口范围格式应为 起始-结束，例如 20000-50000；关闭请用 off。"; return 1;
+            }
+            start=$((10#${BASH_REMATCH[1]})) end=$((10#${BASH_REMATCH[2]}))
+            ((start >= 1024 && end <= 65535 && start < end)) || {
+                fail "端口范围需在 1024–65535 之间，且起始小于结束。"; return 1;
+            }
+            ports="$start-$end" ;;
+    esac
+    [[ -s "$profiles_file" ]] || { fail "未找到本脚本的节点资料 ${profiles_file}。"; return 1; }
+    NODE_PROFILES=$(jq -c '.' "$profiles_file") || return 1
+    printf '%s\n' "$NODE_PROFILES" >"$RUN_DIR/profiles.json" || return 1
+    hy2_port=$(jq -r '.[] | select(.key == "hy2") | .port' <<<"$NODE_PROFILES")
+    hy2_tag=$(jq -r '.[] | select(.key == "hy2") | .payload.tag' <<<"$NODE_PROFILES")
+    valid_port "$hy2_port" || { fail "资料文件中没有 Hy2 节点。"; return 1; }
+    id=$(hy2_inbound_id "$hy2_tag") || { fail "面板中未找到 Hy2 入站 ${hy2_tag}。"; return 1; }
+    if [[ -z "$ports" && ! -f "$HY2_HOP_CONF" ]] && ! jq -e '.[] | select(.key == "hy2") | .hopPorts' <<<"$NODE_PROFILES" >/dev/null; then
+        log_info "Hy2 端口跳跃未开启，无需关闭。"
+        return 0
+    fi
+    load_panel_context_for_api || return 1
+    api_init || return 1
+    if [[ -n "$ports" ]]; then
+        check_hop_range_free "$start" "$end" "$hy2_port" "$hy2_tag" || return 1
+        ensure_nat_backend || return 1
+        if [[ -f "$HY2_HOP_CONF" ]]; then old_conf=$(cat "$HY2_HOP_CONF"); fi
+        install -d -m 700 "${HY2_HOP_CONF%/*}" || return 1
+        printf 'HOP_START=%s\nHOP_END=%s\nHOP_TARGET=%s\nHOP_BACKEND=%s\n' "$start" "$end" "$hy2_port" "$HY2_HOP_BACKEND" \
+            >"$HY2_HOP_CONF" || return 1
+        chmod 600 "$HY2_HOP_CONF" || return 1
+        write_hy2_hop_script || return 1
+        if ! install_hy2_hop_service || ! /bin/sh "$HY2_HOP_SCRIPT" active; then
+            remove_hy2_hop_service
+            if [[ -n "$old_conf" ]]; then printf '%s\n' "$old_conf" >"$HY2_HOP_CONF"; install_hy2_hop_service || true
+            else rm -f -- "$HY2_HOP_CONF"; fi
+            fail "端口重定向规则未能生效，已撤销本次修改。"; return 1
+        fi
+        log_info "已添加重定向：UDP ${ports} → ${hy2_port}（${HY2_HOP_BACKEND}）。"
+    fi
+    if ! update_hy2_inbound_hop "$id" "$ports"; then
+        if [[ -n "$ports" && -n "$old_conf" ]]; then
+            printf '%s\n' "$old_conf" >"$HY2_HOP_CONF"
+            install_hy2_hop_service || log_warn "恢复原端口跳跃规则失败，请运行 --hy2-hop status 检查。"
+        elif [[ -n "$ports" ]]; then
+            remove_hy2_hop_service
+            rm -f -- "$HY2_HOP_CONF"
+        fi
+        return 1
+    fi
+    if [[ -z "$ports" ]]; then
+        remove_hy2_hop_service
+        rm -f -- "$HY2_HOP_CONF" "$HY2_HOP_SCRIPT"
+        rmdir -- "${HY2_HOP_CONF%/*}" 2>/dev/null || true
+        log_info "已关闭 Hy2 端口跳跃并删除重定向规则。"
+    fi
+    wait_hy2_listening "$hy2_port" || return 1
+    apply_hy2_hop_profile "$ports" || return 1
+    load_ports_from_profiles
+    write_node_files || return 1
+    refresh_subscription_links || log_warn "统一订阅中的链接未能更新；可运行 --enable-subscription 重新同步。"
+    if [[ -n "$ports" ]]; then
+        log_info "Hy2 端口跳跃已开启：客户端会在 UDP ${ports} 内换端口连接。"
+        log_warn "请在云安全组和系统防火墙放行 UDP ${ports}；旧客户端需重新导入 Hy2 链接或刷新订阅。"
+        printf '%s\n' "$(jq -r '.[] | select(.key == "hy2") | .link' <<<"$NODE_PROFILES")"
+    fi
+}
+
 # 14. 向已有面板增添长期节点，保留原入站、证书与管理员账户。
 existing_panel_setting() {
     local key="$1"
@@ -2195,6 +2526,7 @@ maintenance_command() {
             printf '\n清空重装会备份并移走旧面板数据，重新生成面板账号、四节点和认证。\n'
             printf '旧节点与订阅链接将失效，服务会中断；这不是保留配置的升级。\n'
         fi
+        print_extra_services_notice
         prompt_read "输入 $expected 确认（其他输入取消）：" confirmation
         [[ "$confirmation" == "$expected" ]] || { log_info "已取消操作，未修改原配置。"; return 0; }
     fi
@@ -2259,6 +2591,7 @@ print_usage() {
   --switch-domain 域名       迁移现有节点证书与连接域名
   --enable-subscription      本脚本的节点共用一条订阅链接（含 Clash/Mihomo 格式）
   --show-links               显示订阅、节点链接及二维码（只读）
+  --hy2-hop 范围|off|status  Hy2 端口跳跃，例如 --hy2-hop 20000-50000
   --update-xray              更新 Xray 内核到官方最新稳定版（启动失败自动恢复）
   --enable-xray-auto-update  开启每日自动检查并更新 Xray 内核
   --disable-xray-auto-update 关闭 Xray 自动更新
@@ -2353,9 +2686,10 @@ interactive_menu() {
             '  14) 关闭 Xray 自动更新' \
             '  15) 开启统一订阅（一条链接导入全部节点）' \
             '  16) 查看订阅、节点链接与二维码' \
+            '  17) Hy2 端口跳跃（开启、修改或关闭）' \
             '  0) 退出'
         choice=""
-        if ! menu_read_choice choice '请选择 [0-16]：'; then
+        if ! menu_read_choice choice '请选择 [0-17]：'; then
             printf '\n输入已结束，退出菜单。\n'
             return 0
         fi
@@ -2387,8 +2721,14 @@ interactive_menu() {
             14) menu_run_action --disable-xray-auto-update ;;
             15) menu_run_action --enable-subscription ;;
             16) menu_run_action --show-links ;;
+            17)
+                menu_run_action --hy2-hop status
+                domain=""
+                if ! menu_read_choice domain 'UDP 端口范围（如 20000-50000；off 关闭；留空取消）：'; then return 0; fi
+                if [[ -n "$domain" ]]; then menu_run_action --hy2-hop "$domain"; fi
+                ;;
             '') ;;
-            *) log_warn "请输入 0–16。" ;;
+            *) log_warn "请输入 0–17。" ;;
         esac
     done
 }
@@ -2403,6 +2743,8 @@ main() {
             [[ $# -eq 1 ]] || { fail "${action} 不接受额外参数。"; return 1; } ;;
         --switch-domain)
             [[ $# -le 2 ]] || { fail "--switch-domain 只接受一个域名。"; return 1; } ;;
+        --hy2-hop)
+            [[ $# -eq 2 ]] || { fail "--hy2-hop 需要一个参数：端口范围、off 或 status。"; return 1; } ;;
         --update-xray)
             [[ $# -eq 1 || ( $# -eq 2 && "$2" == --auto ) ]] || {
                 fail "--update-xray 只接受可选的 --auto。"; return 1;
@@ -2427,6 +2769,13 @@ main() {
         --update-xray) acquire_maintenance_lock; update_xray_core "${2:-}" ;;
         --enable-subscription) acquire_maintenance_lock; enable_subscription_command ;;
         --show-links) show_links_command ;;
+        --hy2-hop)
+            if [[ "$2" == status ]]; then
+                hy2_hop_command status
+            else
+                acquire_maintenance_lock; hy2_hop_command "$2"
+            fi
+            ;;
         --enable-xray-auto-update) enable_xray_auto_update ;;
         --disable-xray-auto-update) disable_xray_auto_update ;;
         '')
