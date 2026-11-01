@@ -111,7 +111,7 @@ random_panel_port() {
     for _ in {1..30}; do
         candidate=$((10000 + RANDOM % 45001))
         if [[ "$candidate" != "${RAW_PORT:-443}" && "$candidate" != "${REALITY_PORT:-24443}" &&
-              "$candidate" != "${XHTTP_PORT:-8443}" ]]; then
+              "$candidate" != "${XHTTP_PORT:-8443}" && "$candidate" != "${SUB_PORT:-2096}" ]]; then
             printf '%s\n' "$candidate"; return 0
         fi
     done
@@ -121,7 +121,8 @@ random_panel_port() {
 validate_config() {
     case "${PRIMARY_NODE:-}" in hy2|raw|reality|xhttp) ;; *) fail "PRIMARY_NODE 只能是 hy2、raw、reality 或 xhttp。"; return 1 ;; esac
     local name value seen='|80|'
-    for name in PANEL_PORT RAW_PORT REALITY_PORT XHTTP_PORT HY2_PORT; do
+    SUB_PORT="${SUB_PORT:-2096}"
+    for name in PANEL_PORT RAW_PORT REALITY_PORT XHTTP_PORT SUB_PORT HY2_PORT; do
         value="${!name:-}"
         valid_port "$value" || { fail "${name} 必须是 1–65535 的端口。"; return 1; }
         printf -v "$name" '%d' "$((10#$value))"
@@ -147,7 +148,7 @@ validate_config() {
 
 check_ports_available() {
     local name port
-    for name in PANEL_PORT RAW_PORT REALITY_PORT XHTTP_PORT; do
+    for name in PANEL_PORT RAW_PORT REALITY_PORT XHTTP_PORT SUB_PORT; do
         port="${!name}"
         [[ -z "$(ss -H -lnt "sport = :${port}")" ]] || { fail "${name}=${port}/TCP 已被占用，请指定其它端口。"; return 1; }
     done
@@ -429,7 +430,16 @@ switch_existing_to_domain() (
     # 面板证书路径只含已验证域名；入站 JSON 使用 SQLite quote() 生成 SQL。
     local cert_sql="${CERT_FILE//\'/\'\'}" key_sql="${KEY_FILE//\'/\'\'}"
     settings_exist=$(sqlite3 "$XUI_DB_PATH" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='settings';") || return 1
+    local sub_cert_follow=0 sub_updates=0 old_web_cert old_web_key old_sub_cert old_sub_key
     if [[ "$settings_exist" == 1 ]]; then
+        # 订阅服务与面板使用同一证书时（本脚本新装即如此），随面板一起换成新域名证书。
+        old_web_cert=$(sqlite3 "$XUI_DB_PATH" "SELECT value FROM settings WHERE key='webCertFile';") || return 1
+        old_web_key=$(sqlite3 "$XUI_DB_PATH" "SELECT value FROM settings WHERE key='webKeyFile';") || return 1
+        old_sub_cert=$(sqlite3 "$XUI_DB_PATH" "SELECT value FROM settings WHERE key='subCertFile';") || return 1
+        old_sub_key=$(sqlite3 "$XUI_DB_PATH" "SELECT value FROM settings WHERE key='subKeyFile';") || return 1
+        if [[ -n "$old_sub_cert" && "$old_sub_cert" == "$old_web_cert" && "$old_sub_key" == "$old_web_key" ]]; then
+            sub_cert_follow=1
+        fi
         for name in webCertFile webKeyFile; do
             if [[ "$name" == webCertFile ]]; then expected="$cert_sql"; else expected="$key_sql"; fi
             existing=$(sqlite3 "$XUI_DB_PATH" "SELECT count(*) FROM settings WHERE key='$name';") || return 1
@@ -461,13 +471,21 @@ switch_existing_to_domain() (
         printf 'UPDATE inbounds SET stream_settings=%s WHERE id=%s AND stream_settings=%s;\n' "$raw_stream" "$id" "$new_stream" >>"$domain_rollback_sql"
         printf 'UPDATE inbounds SET stream_settings=%s WHERE id=%s AND stream_settings=%s;\nSELECT changes();\n' "$new_stream" "$id" "$raw_stream" >>"$domain_state/updates.sql"
     done
+    if [[ "$sub_cert_follow" == 1 ]]; then
+        for name in subCertFile subKeyFile; do
+            if [[ "$name" == subCertFile ]]; then expected="$cert_sql"; else expected="$key_sql"; fi
+            sqlite3 "$XUI_DB_PATH" "SELECT 'UPDATE settings SET value=' || quote(value) || ' WHERE key=' || quote(key) || ' AND value=' || quote('$expected') || ';' FROM settings WHERE key='$name';" >>"$domain_rollback_sql" || return 1
+            sqlite3 "$XUI_DB_PATH" "SELECT 'UPDATE settings SET value=' || quote('$expected') || ' WHERE key=' || quote(key) || ' AND value=' || quote(value) || ';' || char(10) || 'SELECT changes();' FROM settings WHERE key='$name';" >>"$domain_state/updates.sql" || return 1
+            sub_updates=$((sub_updates + 1))
+        done
+    fi
     printf 'COMMIT;\n' >>"$domain_rollback_sql"
     chmod 600 "$domain_rollback_sql" "$domain_state/updates.sql"
     trap domain_recovery_exit EXIT
     domain_mutated=1
     "${XUI_INSTALL_DIR}/x-ui" cert -webCert "$CERT_FILE" -webCertKey "$KEY_FILE" >/dev/null || return 1
     changes=$(sqlite3 -bail "$XUI_DB_PATH" <"$domain_state/updates.sql") || return 1
-    [[ $(printf '%s\n' "$changes" | grep -c '^1$') -eq ${#ids[@]} ]] || { fail "部分入站在更新时被修改，已取消域名切换。"; return 1; }
+    [[ $(printf '%s\n' "$changes" | grep -c '^1$') -eq $((${#ids[@]} + sub_updates)) ]] || { fail "部分入站在更新时被修改，已取消域名切换。"; return 1; }
     restart_panel || { fail "面板重启失败。数据库备份：$backup"; return 1; }
 
     if [[ -s "$profile_file" ]]; then
@@ -504,8 +522,14 @@ switch_existing_to_domain() (
         HY2_PORT=$(jq -r '.[] | select(.key == "hy2") | .port' <<<"$NODE_PROFILES")
         XHTTP_PORT=$(jq -r '.[] | select(.key == "xhttp") | .port' <<<"$NODE_PROFILES")
         write_node_files || return 1
+        refresh_subscription_links || log_warn "统一订阅中的链接未能更新；可运行 --enable-subscription 重新同步。"
         log_info "全部节点与链接已切换到 $CERT_HOST；原 UUID 和认证凭据已保留。"
         cat "$XUI_INFO_DIR/3x-ui-node-links.txt"
+        load_subscription_urls "$profile_file"
+        if [[ "$SUB_STATUS" == ok ]]; then
+            print_subscription_block
+            log_info "订阅地址已随域名变化，请在客户端改用上面的新订阅地址。"
+        fi
     else
         local legacy="$XUI_INFO_DIR/3x-ui-xhttp-info.txt"
         if [[ -f "$legacy" ]]; then
@@ -524,6 +548,7 @@ init_config() {
     REALITY_PORT="${REALITY_PORT:-24443}"
     HY2_PORT="${HY2_PORT:-24444}"
     XHTTP_PORT="${XHTTP_PORT:-${INBOUND_PORT:-8443}}"
+    SUB_PORT="${XUI_SUB_PORT:-${SUB_PORT:-2096}}"
     PRIMARY_NODE="${PRIMARY_NODE:-hy2}"
     REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-www.apple.com}"
     REALITY_TARGET="${REALITY_TARGET:-${REALITY_SERVER_NAME}:443}"
@@ -730,6 +755,14 @@ prepare_node_profiles() {
     xhttp_uuid=$(gen_uuid)
     hy2_auth=$(gen_random_str 32)
     nonce=$(gen_random_str 16)
+    # 3x-ui 要求每个客户端的订阅 ID 唯一，这里全部随机生成。主用节点客户端的订阅作为
+    # 统一订阅，其他节点以“外部链接”挂到它下面，各节点仍保留独立认证凭据。
+    SUB_ID="${SUB_ID:-$(gen_random_str 20)}"
+    [[ "$SUB_ID" =~ ^[A-Za-z0-9_-]{8,64}$ ]] || { fail "订阅 ID 格式无效。"; return 1; }
+    local sub_ids
+    sub_ids=$(jq -cn --arg owner "${PRIMARY_NODE:-hy2}" --arg sub "$SUB_ID" --arg a "$(gen_random_str 20)" \
+        --arg b "$(gen_random_str 20)" --arg c "$(gen_random_str 20)" --arg d "$(gen_random_str 20)" '
+        {hy2: $a, raw: $b, reality: $c, xhttp: $d} | .[$owner] = $sub')
 
     NODE_PROFILES=$(
         printf '%s\n' "$raw_uuid" "$reality_uuid" "$xhttp_uuid" "$hy2_auth" "$nonce" \
@@ -749,6 +782,7 @@ prepare_node_profiles() {
         --arg reality_sni "$REALITY_SERVER_NAME" \
         --arg reality_target "$REALITY_TARGET" \
         --arg xhttp_tls_mode "${INBOUND_TLS_MODE:-1}" \
+        --argjson sub_ids "$sub_ids" \
         --arg primary "${PRIMARY_NODE:-hy2}" '
         input as $raw_uuid | input as $reality_uuid | input as $xhttp_uuid |
         input as $hy2_auth | input as $nonce | input as $dec | input as $enc |
@@ -756,7 +790,7 @@ prepare_node_profiles() {
         def client_common($key): {
             email: ("3xuish_" + $key + "_" + $nonce),
             limitIp: 0, totalGB: 0, expiryTime: 0, enable: true,
-            tgId: 0, subId: ($nonce + "_" + $key), comment: "", reset: 0
+            tgId: 0, subId: $sub_ids[$key], comment: "", reset: 0
         };
         def vless_settings($key; $uuid; $decryption; $encryption): {
             clients: [client_common($key) + {id: $uuid, flow: "xtls-rprx-vision"}],
@@ -1083,6 +1117,18 @@ write_node_files() {
         printf '访问地址：%s://%s:%s%s/\n' "${PANEL_API_SCHEME:-https}" "$CERT_HOST" "$PANEL_PORT" "${WEB_BASE_PATH:+/$WEB_BASE_PATH}"
         printf '管理员账号：%s\n管理员密码：%s\n' "$PANEL_USER" "$PANEL_PASS"
         printf '证书文件：%s\n私钥文件：%s\n' "$CERT_FILE" "$KEY_FILE"
+        load_subscription_urls "$profiles_file"
+        if [[ "$SUB_STATUS" == ok ]]; then
+            printf '\n[统一订阅]\n'
+            printf '通用订阅（v2rayN、v2rayNG、Shadowrocket 等）：%s\n' "$SUB_URL"
+            if [[ -n "$SUB_CLASH_URL" ]]; then printf 'Clash / Mihomo 订阅：%s\n' "$SUB_CLASH_URL"; fi
+            printf '订阅包含本脚本创建的节点；需放行 TCP/%s。' "$SUB_LISTEN_PORT"
+            if [[ "$SUB_SCHEME" == http ]]; then printf '当前为 HTTP 明文，可运行 --enable-subscription 改为 HTTPS。'; fi
+            printf '\n订阅由「%s」的客户端承载，其他节点是它的外部链接（面板中该客户端的“链接”页）；请勿删除这些外部链接。\n' \
+                "$(jq -r '.[] | select(.subscriptionOwner == true) | .label' "$profiles_file")"
+        elif [[ "$SUB_STATUS" == disabled || "$SUB_STATUS" == inactive ]]; then
+            printf '\n统一订阅：尚未开启，可运行 --enable-subscription 一条链接导入全部节点。\n'
+        fi
         printf '\n[节点与导入链接]\n'
         local key label port kind link primary
         while IFS=$'\t' read -r key label port kind primary link; do
@@ -1094,8 +1140,10 @@ write_node_files() {
             printf '%s\n' "$link"
         done < <(jq -r '.[] | [.key, .label, .port, (if .key == "hy2" then "UDP" else "TCP" end), .primary, .link] | @tsv' "$profiles_file")
         printf '\n[使用步骤]\n'
-        printf '1. 在云安全组与系统防火墙开放 Hy2 UDP/%s、RAW TCP/%s、REALITY TCP/%s、XHTTP TCP/%s。\n' \
+        printf '1. 在云安全组与系统防火墙开放 Hy2 UDP/%s、RAW TCP/%s、REALITY TCP/%s、XHTTP TCP/%s' \
             "$HY2_PORT" "$RAW_PORT" "$REALITY_PORT" "$XHTTP_PORT"
+        if [[ "$SUB_STATUS" == ok ]]; then printf '、订阅 TCP/%s' "$SUB_LISTEN_PORT"; fi
+        printf '。\n'
         printf '2. 在 v2rayN 等客户端逐条导入上方链接，先连接标为“主用”的节点；若 UDP 无法连接，试 RAW/REALITY TCP。\n'
         printf '3. 每个新节点有独立认证凭据。修改端口、UUID、密钥或传输后，客户端需要重新导入对应链接。\n'
         printf '4. 所有 TLS 入站的面板范围为最小 1.0、最大 1.3；Hy2 使用 QUIC，实际握手仍为 TLS 1.3。REALITY 使用独立安全设置。\n'
@@ -1116,6 +1164,332 @@ write_node_files() {
 print_summary() {
     log_info "部署成功：四个节点已创建且 Xray 正在监听。"
     cat "$XUI_INFO_DIR/3x-ui-nodes-info.txt"
+}
+
+# 16. 统一订阅：使用 3x-ui 自带的订阅服务。3x-ui 要求每个客户端的订阅 ID 唯一，
+# 因此由主用节点的客户端承载统一订阅，其他节点的分享链接作为它的“外部链接”。
+# 各节点保留独立认证凭据，订阅里的链接与资料文件中的链接一致。
+url_host() {
+    if [[ "$1" == *:* ]]; then printf '[%s]\n' "$1"; else printf '%s\n' "$1"; fi
+}
+
+# 键不存在时返回 3x-ui 的默认值；键名固定，避免拼接任意 SQL。
+panel_setting_or_default() {
+    local key="$1" default="$2" value
+    case "$key" in
+        subEnable|subPort|subPath|subURI|subListen|subCertFile|subKeyFile|\
+        subClashEnable|subClashPath|subClashURI) ;;
+        *) fail "不支持读取该面板设置。"; return 1 ;;
+    esac
+    # 面板重启时会短暂写库；等待锁释放，避免把“数据库忙”当成读取失败。
+    value=$(sqlite3 -readonly -cmd '.timeout 10000' "$XUI_DB_PATH" \
+        "SELECT value FROM settings WHERE key='$key' LIMIT 1;" 2>/dev/null) || {
+        fail "无法读取面板设置 ${key}。"; return 1;
+    }
+    printf '%s\n' "${value:-$default}"
+}
+
+normalize_url_path() {
+    local path="${1:-/}"
+    [[ "$path" == /* ]] || path="/$path"
+    [[ "$path" == */ ]] || path="$path/"
+    printf '%s\n' "$path"
+}
+
+# 资料文件中标记为订阅承载的节点；没有标记时为空。
+profiles_sub_owner() {
+    jq -er '[.[] | select(.subscriptionOwner == true)] | if length == 1 then .[0].key else empty end' "$1" 2>/dev/null
+}
+
+profiles_sub_id() {
+    jq -er '[.[] | select(.subscriptionOwner == true)] | if length == 1 then
+        (.[0].payload.settings | fromjson | .clients[0].subId // "") else "" end |
+        select(test("^[A-Za-z0-9_-]{8,64}$"))' "$1" 2>/dev/null
+}
+
+# 订阅承载节点：已有标记优先，否则选主用节点。
+subscription_owner_key() {
+    jq -er '([.[] | select(.subscriptionOwner == true)][0] // [.[] | select(.primary == true)][0] // .[0]).key' "$1"
+}
+
+# 订阅外部链接：除承载节点外的全部节点，以及已开启的 Argo 节点。
+subscription_external_links() {
+    local profiles="$1" owner="$2" argo="$XUI_INFO_DIR/3x-ui-argo.json"
+    if [[ -s "$argo" ]]; then
+        jq -cn --slurpfile p "$profiles" --slurpfile a "$argo" --arg owner "$owner" '
+            [($p[0][] | select(.key != $owner)), $a[0] | {kind: "link", value: .link, remark: .remark}]'
+    else
+        jq -c --arg owner "$owner" '[.[] | select(.key != $owner) | {kind: "link", value: .link, remark: .remark}]' "$profiles"
+    fi
+}
+
+# 设置 SUB_STATUS（ok、disabled、inactive、unavailable）及订阅地址；读取失败不影响节点信息输出。
+load_subscription_urls() {
+    local profiles="$1" sub_id enabled port path uri cert key clash clash_path clash_uri scheme host
+    SUB_STATUS="unavailable" SUB_URL="" SUB_CLASH_URL="" SUB_SCHEME="" SUB_LISTEN_PORT=""
+    [[ -s "$profiles" && -f "$XUI_DB_PATH" ]] || return 0
+    sub_id=$(profiles_sub_id "$profiles") || { SUB_STATUS="inactive"; return 0; }
+    enabled=$(panel_setting_or_default subEnable true) || return 0
+    if [[ "$enabled" != true ]]; then SUB_STATUS="disabled"; return 0; fi
+    port=$(panel_setting_or_default subPort 2096) || return 0
+    path=$(panel_setting_or_default subPath /sub/) || return 0
+    uri=$(panel_setting_or_default subURI '') || return 0
+    cert=$(panel_setting_or_default subCertFile '') || return 0
+    key=$(panel_setting_or_default subKeyFile '') || return 0
+    clash=$(panel_setting_or_default subClashEnable false) || return 0
+    clash_path=$(panel_setting_or_default subClashPath /clash/) || return 0
+    clash_uri=$(panel_setting_or_default subClashURI '') || return 0
+    valid_port "$port" || return 0
+    scheme=http
+    if [[ -n "$cert" && -n "$key" ]]; then scheme=https; fi
+    host=$(url_host "${CERT_HOST:-${SERVER_IP:-}}")
+    [[ "$host" != "" && "$host" != "[]" ]] || return 0
+    if [[ -n "$uri" ]]; then
+        SUB_URL="${uri%/}/$sub_id"
+    else
+        SUB_URL="$scheme://$host:$port$(normalize_url_path "$path")$sub_id"
+    fi
+    if [[ "$clash" == true ]]; then
+        if [[ -n "$clash_uri" ]]; then
+            SUB_CLASH_URL="${clash_uri%/}/$sub_id"
+        else
+            SUB_CLASH_URL="$scheme://$host:$port$(normalize_url_path "$clash_path")$sub_id"
+        fi
+    fi
+    SUB_SCHEME="$scheme" SUB_LISTEN_PORT="$port" SUB_STATUS="ok"
+}
+
+# fresh：新装面板，订阅改为 HTTPS（复用节点证书）并开启 Clash/Mihomo 格式。
+# existing：只做增量修改，开启订阅与 Clash；HTTP 改 HTTPS 会让旧地址失效，需要确认。
+configure_subscription() {
+    local mode="$1" response current updated enabled cert answer changes=() joined
+    SUB_SETTINGS_CHANGED=0
+    response=$(api_request POST '/panel/api/setting/all' '{}') || { fail "无法读取面板设置。"; return 1; }
+    current=$(jq -ce 'select(.success == true) | .obj | objects' <<<"$response") || {
+        fail "面板未返回设置，可能版本过旧；未修改订阅设置。"; return 1;
+    }
+    updated="$current"
+    enabled=$(jq -r '.subEnable' <<<"$current") || return 1
+    cert=$(jq -r '.subCertFile // ""' <<<"$current") || return 1
+    if [[ "$mode" == fresh ]]; then
+        updated=$(jq -c --argjson port "$SUB_PORT" --arg cert "$CERT_FILE" --arg key "$KEY_FILE" '
+            .subEnable = true | .subClashEnable = true | .subPort = $port |
+            .subCertFile = $cert | .subKeyFile = $key' <<<"$current") || return 1
+        changes+=("订阅端口 TCP/${SUB_PORT}，HTTPS，Clash/Mihomo 格式")
+    else
+        if [[ "$enabled" != true ]]; then
+            updated=$(jq -c --argjson port "$SUB_PORT" --arg cert "$CERT_FILE" --arg key "$KEY_FILE" '
+                .subEnable = true | .subPort = $port | .subCertFile = $cert | .subKeyFile = $key' <<<"$updated") || return 1
+            changes+=("开启订阅服务 TCP/${SUB_PORT}（HTTPS）")
+        elif [[ -z "$cert" ]]; then
+            answer=""
+            if [[ "${AUTO_YES:-0}" != 1 ]]; then
+                printf '订阅服务当前为 HTTP 明文。改为 HTTPS 会使用节点证书 %s，已分发的 HTTP 订阅地址将失效。\n' "$CERT_FILE"
+                prompt_read "改为 HTTPS？[Y/n]: " answer
+            fi
+            if [[ ! "$answer" =~ ^[Nn] ]]; then
+                updated=$(jq -c --arg cert "$CERT_FILE" --arg key "$KEY_FILE" '
+                    .subCertFile = $cert | .subKeyFile = $key' <<<"$updated") || return 1
+                changes+=("订阅服务改为 HTTPS")
+            fi
+        fi
+        if [[ "$(jq -r '.subClashEnable' <<<"$updated")" != true ]]; then
+            updated=$(jq -c '.subClashEnable = true' <<<"$updated") || return 1
+            changes+=("开启 Clash/Mihomo 订阅格式")
+        fi
+    fi
+    if [[ ${#changes[@]} -eq 0 ]]; then
+        log_info "订阅服务设置无需修改。"
+        return 0
+    fi
+    response=$(api_request POST '/panel/api/setting/update' "$updated") || { fail "保存订阅设置时面板无响应。"; return 1; }
+    jq -e '.success == true' >/dev/null <<<"$response" || {
+        fail "面板拒绝订阅设置：$(jq -r '.msg // "未知原因"' <<<"$response" 2>/dev/null)"; return 1;
+    }
+    SUB_SETTINGS_CHANGED=1
+    printf -v joined '%s；' "${changes[@]}"
+    log_info "已更新订阅设置：${joined%；}"
+}
+
+subscription_owner_email() {
+    jq -er --arg key "$2" '.[] | select(.key == $key) | .payload.settings | fromjson | .clients[0].email |
+        select(test("^[A-Za-z0-9_.@-]+$"))' "$1"
+}
+
+# 把其他节点（及 Argo 节点）的当前链接写入承载客户端的外部链接，整组替换。
+sync_subscription_links() {
+    local profiles="$1" owner="$2" email links response
+    email=$(subscription_owner_email "$profiles" "$owner") || { fail "无法确定订阅承载客户端。"; return 1; }
+    links=$(subscription_external_links "$profiles" "$owner") || return 1
+    response=$(api_request POST "/panel/api/clients/$email/externalLinks" "$(jq -cn --argjson l "$links" '{externalLinks: $l}')") || {
+        fail "写入订阅外部链接时面板无响应，面板版本可能过旧。"; return 1;
+    }
+    jq -e '.success == true' >/dev/null <<<"$response" || {
+        fail "面板拒绝订阅外部链接：$(jq -r '.msg // "未知原因"' <<<"$response" 2>/dev/null)"; return 1;
+    }
+}
+
+# 从本机请求订阅，确认每个节点的认证凭据都在订阅内容中。
+verify_subscription() {
+    local profiles="$1" sub_id="$2" port path listen scheme cert key base body decoded credential clash clash_path missing=0
+    port=$(panel_setting_or_default subPort 2096) || return 1
+    path=$(normalize_url_path "$(panel_setting_or_default subPath /sub/)") || return 1
+    listen=$(panel_setting_or_default subListen '') || return 1
+    cert=$(panel_setting_or_default subCertFile '') || return 1
+    key=$(panel_setting_or_default subKeyFile '') || return 1
+    clash=$(panel_setting_or_default subClashEnable false) || return 1
+    clash_path=$(normalize_url_path "$(panel_setting_or_default subClashPath /clash/)") || return 1
+    scheme=http
+    if [[ -n "$cert" && -n "$key" ]]; then scheme=https; fi
+    case "$listen" in ''|0.0.0.0|::|'[::]') listen=127.0.0.1 ;; esac
+    base="$scheme://$(url_host "$listen"):$port"
+    body=""
+    for _ in {1..30}; do
+        body=$(curl -q -fsSk --noproxy '*' --connect-timeout 3 --max-time 10 "$base$path$sub_id" 2>/dev/null) || body=""
+        [[ -z "$body" ]] || break
+        sleep 1
+    done
+    [[ -n "$body" ]] || { fail "订阅服务未响应：$base$path"; return 1; }
+    decoded=$(printf '%s' "$body" | base64 -d 2>/dev/null) || decoded=""
+    [[ "$decoded" == *://* ]] || decoded="$body"
+    while IFS= read -r credential; do
+        [[ "$decoded" == *"$credential"* ]] || { fail "订阅内容缺少节点（凭据前缀 ${credential:0:6}）。"; return 1; }
+    done < <(subscription_credentials "$profiles")
+    if [[ "$clash" == true ]]; then
+        body=$(curl -q -fsSk --noproxy '*' --connect-timeout 3 --max-time 10 "$base$clash_path$sub_id" 2>/dev/null) || body=""
+        [[ "$body" == *proxies:* ]] || { fail "Clash/Mihomo 订阅未返回节点列表。"; return 1; }
+        while IFS= read -r credential; do
+            [[ "$body" == *"$credential"* ]] || missing=$((missing + 1))
+        done < <(subscription_credentials "$profiles")
+        if ((missing > 0)); then
+            log_warn "Clash/Mihomo 订阅中有 ${missing} 个节点无法用该格式表示，这些节点请使用通用订阅。"
+        fi
+    fi
+    log_info "订阅服务已返回全部 $(subscription_credentials "$profiles" | wc -l | tr -d ' ') 个节点。"
+}
+
+subscription_credentials() {
+    jq -r '.[].credential' "$1"
+    if [[ -s "$XUI_INFO_DIR/3x-ui-argo.json" ]]; then jq -r '.credential' "$XUI_INFO_DIR/3x-ui-argo.json"; fi
+}
+
+mark_subscription_owner() {
+    NODE_PROFILES=$(jq -c --arg owner "$1" 'map(if .key == $owner then .subscriptionOwner = true else del(.subscriptionOwner) end)' \
+        <<<"$NODE_PROFILES") || return 1
+    printf '%s\n' "$NODE_PROFILES" >"$RUN_DIR/profiles.json"
+}
+
+# 面板客户端记录的 id 是数据库序号，UUID 在 uuid 字段；这里换回客户端结构体的字段名。
+sub_id_update_payload() {
+    jq -ce --arg sub "$2" '{
+        id: (.uuid // ""), password: (.password // ""), auth: (.auth // ""), flow: (.flow // ""),
+        security: (.security // ""), email, limitIp: (.limitIp // 0), totalGB: (.totalGB // 0),
+        expiryTime: (.expiryTime // 0), enable: (.enable // true), tgId: (.tgId // 0), subId: $sub,
+        group: (.group // ""), comment: (.comment // ""), reset: (.reset // 0),
+        resetDay: (.resetDay // 0), resetWeekday: (.resetWeekday // 0), resetMax: (.resetMax // 0),
+        trafficReset: (.trafficReset // "never"), trafficResetDay: (.trafficResetDay // 1),
+        limitHwid: (.limitHwid // 0)
+    } | with_entries(select(.value != "" or (.key | IN("email", "subId", "comment", "group"))))' <<<"$1"
+}
+
+# 旧版的订阅 ID 由节点标签派生；改为随机值，只影响承载客户端，其他客户端不变。
+rotate_owner_sub_id() {
+    local email="$1" response record payload
+    response=$(api_request GET "/panel/api/clients/get/$email") || { fail "无法读取客户端 $email，面板版本可能过旧。"; return 1; }
+    record=$(jq -ce 'select(.success == true) | .obj.client | objects' <<<"$response") || {
+        fail "面板未返回客户端 $email。"; return 1;
+    }
+    SUB_ID=$(gen_random_str 20)
+    payload=$(sub_id_update_payload "$record" "$SUB_ID") || { fail "无法生成客户端更新内容。"; return 1; }
+    response=$(api_request POST "/panel/api/clients/update/$email" "$payload") || { fail "更新 $email 时面板无响应。"; return 1; }
+    jq -e '.success == true' >/dev/null <<<"$response" || {
+        fail "面板拒绝更新 ${email}：$(jq -r '.msg // "未知原因"' <<<"$response" 2>/dev/null)"; return 1;
+    }
+    NODE_PROFILES=$(jq -c --arg email "$email" --arg sub "$SUB_ID" '
+        map(if (.payload.settings | fromjson | .clients[0].email) == $email then
+            .payload.settings |= (fromjson | .clients |= map(.subId = $sub) | tojson) else . end)' <<<"$NODE_PROFILES") || return 1
+    printf '%s\n' "$NODE_PROFILES" >"$RUN_DIR/profiles.json"
+}
+
+setup_fresh_subscription() {
+    local owner
+    owner=$(subscription_owner_key "$RUN_DIR/profiles.json") || return 1
+    configure_subscription fresh || return 1
+    sync_subscription_links "$RUN_DIR/profiles.json" "$owner" || return 1
+    if [[ "$SUB_SETTINGS_CHANGED" == 1 ]]; then
+        restart_panel || return 1
+    fi
+    verify_subscription "$RUN_DIR/profiles.json" "$SUB_ID" || return 1
+    mark_subscription_owner "$owner"
+}
+
+load_ports_from_profiles() {
+    RAW_PORT=$(jq -r '.[] | select(.key == "raw") | .port' <<<"$NODE_PROFILES")
+    REALITY_PORT=$(jq -r '.[] | select(.key == "reality") | .port' <<<"$NODE_PROFILES")
+    HY2_PORT=$(jq -r '.[] | select(.key == "hy2") | .port' <<<"$NODE_PROFILES")
+    XHTTP_PORT=$(jq -r '.[] | select(.key == "xhttp") | .port' <<<"$NODE_PROFILES")
+}
+
+# 节点链接变化后（域名、端口跳跃、Argo）刷新订阅外部链接；未开启统一订阅时不做任何事。
+refresh_subscription_links() {
+    local profiles="$XUI_INFO_DIR/3x-ui-node-profiles.json" owner
+    owner=$(profiles_sub_owner "$profiles") || return 0
+    if [[ "$API_READY" != 1 ]]; then api_init || return 1; fi
+    sync_subscription_links "$profiles" "$owner" || return 1
+    log_info "统一订阅中的节点链接已更新。"
+}
+
+load_panel_context_for_api() {
+    install_deps || return 1
+    detect_server_ip || return 1
+    resolve_xray_binary || return 1
+    load_existing_panel_context || return 1
+}
+
+# 已有部署开启统一订阅：只处理本脚本资料文件中的节点，其他入站和客户端不变。
+enable_subscription_command() {
+    local profiles_file="$XUI_INFO_DIR/3x-ui-node-profiles.json" owner email
+    [[ -f "$XUI_DB_PATH" ]] || { fail "未检测到 3x-ui 数据库。"; return 1; }
+    [[ -s "$profiles_file" ]] || {
+        fail "未找到本脚本的节点资料 ${profiles_file}；统一订阅只管理本脚本创建的节点。"; return 1;
+    }
+    load_panel_context_for_api || return 1
+    NODE_PROFILES=$(jq -c '.' "$profiles_file") || return 1
+    printf '%s\n' "$NODE_PROFILES" >"$RUN_DIR/profiles.json" || return 1
+    SUB_PORT="${XUI_SUB_PORT:-2096}"
+    valid_port "$SUB_PORT" || { fail "XUI_SUB_PORT 必须是 1–65535 的端口。"; return 1; }
+    api_init || return 1
+    owner=$(subscription_owner_key "$RUN_DIR/profiles.json") || return 1
+    email=$(subscription_owner_email "$RUN_DIR/profiles.json" "$owner") || { fail "无法确定订阅承载客户端。"; return 1; }
+    if ! SUB_ID=$(profiles_sub_id "$RUN_DIR/profiles.json"); then
+        rotate_owner_sub_id "$email" || return 1
+        # 面板中的订阅 ID 已改，资料文件立即同步，避免后续步骤失败时两边不一致。
+        install -m 600 "$RUN_DIR/profiles.json" "$profiles_file" || return 1
+    fi
+    configure_subscription existing || return 1
+    sync_subscription_links "$RUN_DIR/profiles.json" "$owner" || return 1
+    if [[ "$SUB_SETTINGS_CHANGED" == 1 ]]; then
+        log_info "正在重启 ${XUI_SERVICE} 使订阅设置生效..."
+        restart_panel || { fail "面板重启失败。"; return 1; }
+    fi
+    verify_subscription "$RUN_DIR/profiles.json" "$SUB_ID" || return 1
+    mark_subscription_owner "$owner" || return 1
+    verify_running_nodes || return 1
+    load_ports_from_profiles
+    write_node_files || return 1
+    load_subscription_urls "$profiles_file"
+    print_subscription_block
+}
+
+print_subscription_block() {
+    case "${SUB_STATUS:-unavailable}" in
+        ok)
+            printf '\n%b[统一订阅]%b\n' "$CYAN" "$PLAIN"
+            printf '通用订阅（v2rayN、v2rayNG、Shadowrocket 等）：\n%s\n' "$SUB_URL"
+            if [[ -n "$SUB_CLASH_URL" ]]; then printf 'Clash / Mihomo 订阅：\n%s\n' "$SUB_CLASH_URL"; fi
+            ;;
+        disabled|inactive) printf '\n统一订阅：尚未开启，可运行 --enable-subscription 或在菜单选择 15。\n' ;;
+    esac
 }
 
 # 14. 向已有面板增添长期节点，保留原入站、证书与管理员账户。
@@ -1678,6 +2052,11 @@ fresh_install() {
     prepare_node_profiles
     api_init
     create_inbound_nodes
+    # 订阅是附加功能：失败时保留已验证的节点，提示稍后重试。
+    if ! setup_fresh_subscription; then
+        log_warn "统一订阅未能开启；节点不受影响，可稍后运行 --enable-subscription 重试。"
+    fi
+    verify_running_nodes
     write_node_files
     ROLLBACK_NEEDED=0
     print_summary
@@ -1820,6 +2199,7 @@ print_usage() {
   --repair-performance-status 查询最近一次修复结果
   --add-nodes                保留原入站，另加四种节点
   --switch-domain 域名       迁移现有节点证书与连接域名
+  --enable-subscription      本脚本的节点共用一条订阅链接（含 Clash/Mihomo 格式）
   --update-xray              更新 Xray 内核到官方最新稳定版（启动失败自动恢复）
   --enable-xray-auto-update  开启每日自动检查并更新 Xray 内核
   --disable-xray-auto-update 关闭 Xray 自动更新
@@ -1912,9 +2292,10 @@ interactive_menu() {
             '  12) 一键更新 Xray 内核（官方最新稳定版，失败自动恢复）' \
             '  13) 开启 Xray 每日自动更新' \
             '  14) 关闭 Xray 自动更新' \
+            '  15) 开启统一订阅（一条链接导入全部节点）' \
             '  0) 退出'
         choice=""
-        if ! menu_read_choice choice '请选择 [0-14]：'; then
+        if ! menu_read_choice choice '请选择 [0-15]：'; then
             printf '\n输入已结束，退出菜单。\n'
             return 0
         fi
@@ -1944,8 +2325,9 @@ interactive_menu() {
             12) menu_run_action --update-xray ;;
             13) menu_run_action --enable-xray-auto-update ;;
             14) menu_run_action --disable-xray-auto-update ;;
+            15) menu_run_action --enable-subscription ;;
             '') ;;
-            *) log_warn "请输入 0–14。" ;;
+            *) log_warn "请输入 0–15。" ;;
         esac
     done
 }
@@ -1956,7 +2338,7 @@ main() {
         --help|-h) [[ $# -eq 1 ]] || { fail "帮助选项不能附带其他参数。"; return 1; }; print_usage; return 0 ;;
         --menu|--install|--add-nodes|--reinstall|--reinstall-status|--uninstall|--uninstall-status)
             [[ $# -eq 1 ]] || { fail "${action} 不接受额外参数。"; return 1; } ;;
-        --enable-xray-auto-update|--disable-xray-auto-update)
+        --enable-xray-auto-update|--disable-xray-auto-update|--enable-subscription)
             [[ $# -eq 1 ]] || { fail "${action} 不接受额外参数。"; return 1; } ;;
         --switch-domain)
             [[ $# -le 2 ]] || { fail "--switch-domain 只接受一个域名。"; return 1; } ;;
@@ -1982,6 +2364,7 @@ main() {
         --add-nodes) acquire_maintenance_lock; add_nodes_to_existing ;;
         --switch-domain) acquire_maintenance_lock; switch_existing_to_domain "${2:-}" ;;
         --update-xray) acquire_maintenance_lock; update_xray_core "${2:-}" ;;
+        --enable-subscription) acquire_maintenance_lock; enable_subscription_command ;;
         --enable-xray-auto-update) enable_xray_auto_update ;;
         --disable-xray-auto-update) disable_xray_auto_update ;;
         '')
