@@ -32,6 +32,12 @@ bash /tmp/3xuish-install.sh
 12) 一键更新 Xray 内核
 13) 开启 Xray 每日自动更新
 14) 关闭 Xray 自动更新
+15) 开启统一订阅（一条链接导入全部节点）
+16) 查看订阅、节点链接与二维码
+17) Hy2 端口跳跃（开启、修改或关闭）
+18) Argo 隧道（Cloudflare，IP 被封时备用）
+19) 切换 Xray 内核到指定版本
+20) 回滚到上一次更新前的 Xray 内核
 0) 退出
 ```
 
@@ -61,7 +67,15 @@ bash /tmp/3xuish-install.sh --menu
 bash /tmp/3xuish-install.sh --install
 bash /tmp/3xuish-install.sh --speed-test --seconds 5
 bash /tmp/3xuish-install.sh --speed-test --inbound-id 1 --inbound-id 4
+bash /tmp/3xuish-install.sh --enable-subscription
+bash /tmp/3xuish-install.sh --show-links
+bash /tmp/3xuish-install.sh --hy2-hop 20000-50000
+bash /tmp/3xuish-install.sh --argo quick
+bash /tmp/3xuish-install.sh --switch-xray 26.10.21
+bash /tmp/3xuish-install.sh --rollback-xray
 ```
+
+`bash /tmp/3xuish-install.sh --help` 列出全部选项。
 
 ## 已有服务器清空重装
 
@@ -103,7 +117,7 @@ SSH 断开后在菜单选择 `11`，或查询：
 bash /tmp/3xuish-install.sh --uninstall-status
 ```
 
-以 `complete` 为卸载完成依据。安装、重装、卸载、参数修复、添加节点、域名迁移和 Xray 内核更新共用维护锁；已有维护任务未完成时，其他修改操作会停止，避免同时移动或写入部署数据。操作期间也请勿直接在面板修改配置。
+以 `complete` 为卸载完成依据。安装、重装、卸载、参数修复、添加节点、域名迁移、Xray 内核更新/切换/回滚、统一订阅、端口跳跃和 Argo 隧道共用维护锁；已有维护任务未完成时，其他修改操作会停止，避免同时移动或写入部署数据。操作期间也请勿直接在面板修改配置。
 
 ## 更新 Xray 内核
 
@@ -122,6 +136,19 @@ bash /tmp/3xuish-install.sh --update-xray
 
 此功能只更新 Xray，不更新 3x-ui 面板、geo 文件或操作系统内核。以后升级 3x-ui 面板时，面板会装回自带的 Xray 版本，可再次运行本命令或开启自动更新。通过本机节点代理连接 SSH 时，重启会中断管理连接，建议使用直连 SSH。
 
+### 指定版本与回滚
+
+菜单 `19` 切换到指定版本，`20` 回滚，或执行：
+
+```bash
+bash /tmp/3xuish-install.sh --switch-xray 26.10.21
+bash /tmp/3xuish-install.sh --rollback-xray
+```
+
+`--switch-xray` 可以安装任意官方发布版本，包括降级和预发布版（会提示不稳定）；官方没有的版本号会直接拒绝。`--rollback-xray` 换回上一次更新、切换或回滚之前的内核，当前内核同时成为新的备份，所以再执行一次就能换回来。两者都走上面的同一套校验、替换、启动检查和自动恢复流程。
+
+开启了每日自动更新时，指定的旧版本会在下次检查时被升级到最新稳定版，脚本会提示；要停留在某个版本，请先关闭自动更新。
+
 ### 每日自动更新
 
 菜单 `13` 开启，`14` 关闭，或执行：
@@ -131,11 +158,86 @@ bash /tmp/3xuish-install.sh --enable-xray-auto-update
 bash /tmp/3xuish-install.sh --disable-xray-auto-update
 ```
 
-开启后，脚本会复制到 `/usr/local/lib/3xuish/install.sh`，并在 root 的 crontab 写入一条任务：每天 03:00–05:59 之间的随机时刻（服务器时区）执行与上面相同的检查、校验和回滚，日志写入 `/var/log/3xuish-xray-update.log`。定时任务只运行这份本地副本，不会每天下载远程脚本；要更新副本，用新版脚本重新开启一次即可。发现新版本时会重启一次 `x-ui`。系统需要已安装并运行 cron（安装四节点时已自动安装）。
+开启后，脚本会复制到 `/usr/local/lib/3xuish/install.sh`（Argo 临时隧道也使用这份副本），并在 root 的 crontab 写入一条任务：每天 03:00–05:59 之间的随机时刻（服务器时区）执行与上面相同的检查、校验和回滚，日志写入 `/var/log/3xuish-xray-update.log`。定时任务只运行这份本地副本，不会每天下载远程脚本；要更新副本，用新版脚本重新开启一次即可。发现新版本时会重启一次 `x-ui`。系统需要已安装并运行 cron（安装四节点时已自动安装）。
 
-关闭只删除这条定时任务和本地副本，当前内核、日志和旧内核备份保持不变。
+关闭只删除这条定时任务；本地副本在 Argo 临时隧道也不再使用时才删除。当前内核、日志和旧内核备份保持不变。
 
 CVE-2026-98432 是 Linux 内核 IPv4 TCP 处理中的漏洞。Xray v26.10.31 默认关闭 MPTCP，可以减小攻击面，但不能修复内核本身；根本修复需要通过系统包管理器安装发行版修复后的内核并重启。更新完成后，若系统仍为 `net.mptcp.enabled=1`，脚本会提示当前运行的内核版本。
+
+## 统一订阅
+
+新装会直接开启；已有部署在菜单选择 `15`，或执行：
+
+```bash
+bash /tmp/3xuish-install.sh --enable-subscription
+```
+
+订阅使用 3x-ui 自带的订阅服务，安装结尾和 `/root/3x-ui-nodes-info.txt` 会给出两条地址：
+
+- 通用订阅：v2rayN、v2rayNG、Shadowrocket 等导入后得到全部节点。
+- Clash / Mihomo 订阅：Mihomo 内核的客户端使用。
+
+3x-ui 要求每个客户端的订阅 ID 唯一，因此由主用节点的客户端承载统一订阅，其他节点的分享链接作为它的“外部链接”（面板中该客户端的“链接”页）。各节点仍保留独立的 UUID 和认证凭据，订阅里的链接与资料文件中的一致。请勿在面板中删除这些外部链接；域名切换、端口跳跃和 Argo 隧道的变化会由脚本自动同步。
+
+- **新装**：订阅端口 TCP `2096`（可用 `XUI_SUB_PORT` 指定），使用节点证书提供 HTTPS，并开启 Clash/Mihomo 格式。订阅路径由 3x-ui 随机生成。
+- **已有部署**：只改承载客户端的订阅 ID（旧 ID 由节点标签派生，改为随机值），其他客户端、流量额度和到期时间不变。订阅服务已开启时保留原端口；原来是 HTTP 时会询问是否改为 HTTPS（已分发的 HTTP 订阅地址会失效）。重复执行不会再修改。
+
+需要在安全组放行订阅端口。部分客户端不支持某些协议的 Clash 写法时，脚本会提示这些节点改用通用订阅。
+
+## 节点二维码
+
+安装结尾显示统一订阅的二维码。查看全部节点的链接和二维码，在菜单选择 `16`，或执行：
+
+```bash
+bash /tmp/3xuish-install.sh --show-links
+```
+
+此操作只读。缺少 `qrencode` 时会尝试安装（RHEL 系列可能需要 EPEL，装不上时只显示链接）。超过约 550 个字符的链接（例如 ML-KEM-768 认证的 XHTTP 链接）在终端里过密无法扫描，会提示改用复制链接或统一订阅。
+
+## Hy2 端口跳跃
+
+运营商对单个 UDP 端口限速时，可以让客户端在一段端口范围内轮换连接。在菜单选择 `17`，或执行：
+
+```bash
+bash /tmp/3xuish-install.sh --hy2-hop 20000-50000   # 开启或修改范围
+bash /tmp/3xuish-install.sh --hy2-hop status
+bash /tmp/3xuish-install.sh --hy2-hop off
+```
+
+脚本用 nftables（没有时用 iptables）把这段 UDP 端口重定向到 Hy2 端口，系统支持时同时添加 IPv6 规则，并安装 `3xuish-hy2-hop` 开机服务（systemd 或 OpenRC）恢复规则。Xray 仍只监听原 Hy2 端口；范围同时写入入站的 UDP Hop 设置，分享链接带 `mport`，订阅和 Clash 格式也会带上端口范围。
+
+- 范围内已有其他程序或面板入站使用的 UDP 端口时会拒绝，避免把它们的流量导向 Hy2。
+- 需要在云安全组和系统防火墙放行整段 UDP 范围；旧客户端需重新导入 Hy2 链接或刷新订阅。
+- 客户端需支持端口跳跃（如 v2rayN、Mihomo）；不支持的客户端仍连接原端口。
+- 重新加载 nftables 或 firewalld 可能清掉规则，`--hy2-hop status` 会提示，重新运行开启命令即可恢复。
+
+## Argo 隧道
+
+服务器 IP 被封时，可以经 Cloudflare 的隧道连接。在菜单选择 `18`，或执行：
+
+```bash
+bash /tmp/3xuish-install.sh --argo quick    # 临时隧道，免账号
+bash /tmp/3xuish-install.sh --argo fixed    # 固定隧道，需要 Cloudflare 账号和托管域名
+bash /tmp/3xuish-install.sh --argo status
+bash /tmp/3xuish-install.sh --argo off
+```
+
+脚本下载 Cloudflare 官方 cloudflared（核对发布说明中的 SHA-256），新增一个只监听 `127.0.0.1` 的 VLESS 入站，安装 `3xuish-argo` 开机服务，并把 Argo 节点加入统一订阅。
+
+- 入站使用 WebSocket + VLESS Encryption + Vision：Cloudflare 终止外层 TLS，VLESS Encryption 让它看不到代理内容。实测 XHTTP 无论哪种模式都无法穿过 cloudflared 的本机转发，因此 Argo 节点使用 WebSocket；Xray 会提示 WebSocket 不再推荐，可忽略。
+- **临时隧道**使用 `trycloudflare.com` 域名，仅供测试，无可用性保证，服务每次重启域名都会变。服务启动后会自动把新域名写回面板、资料文件和统一订阅；单独导入的链接需要重新导入。
+- **固定隧道**需要先在 Cloudflare Zero Trust → 网络 → 隧道 创建隧道并复制令牌（也可用 `ARGO_TOKEN`、`ARGO_DOMAIN` 传入）。脚本会提示在“公共主机名”中把域名指向 `HTTP 127.0.0.1:端口`。令牌只保存在 `/etc/3xuish/argo.env`（权限 600），不出现在进程命令行。
+- 关闭会删除 Argo 入站、服务、cloudflared 和相关文件，并从统一订阅中移除。
+
+清空重装和卸载不会处理端口跳跃、Argo 隧道和自动更新；执行前脚本会列出仍在运行的这几项，建议先关闭。
+
+## IPv6 服务器
+
+- **纯 IPv6 服务器**：检测不到公网 IPv4 时自动使用 IPv6 地址部署，IP 证书和域名证书都会让 acme.sh 监听 IPv6（`--listen-v6`）。
+- **双栈服务器**：默认仍用 IPv4；要用 IPv6 部署，设置 `XUI_SERVER_IP` 为 IPv6 地址，例如 `XUI_SERVER_IP=2001:db8::10`。
+- 分享链接、面板地址和订阅地址中的 IPv6 地址会加方括号。
+
+GitHub 不支持 IPv6，而安装 3x-ui、更新 Xray 和下载 cloudflared 都需要访问 GitHub。纯 IPv6 服务器请先配置 NAT64/DNS64，或安装 WARP 获得 IPv4 出口；新装时访问不到 GitHub 会在申请证书前停止并给出提示。
 
 ## 放行需要的端口
 
@@ -149,8 +251,10 @@ CVE-2026-98432 是 Linux 内核 IPv4 TCP 处理中的漏洞。Xray v26.10.31 默
 | `443` | TCP | RAW TCP + TLS |
 | `24443` | TCP | VLESS + REALITY |
 | `8443` | TCP | XHTTP |
+| `2096` | TCP | 统一订阅（`XUI_SUB_PORT` 可改） |
+| 跳跃范围 | UDP | Hy2 端口跳跃，仅在开启后需要 |
 
-如果在向导或环境变量中改过端口，以安装结尾输出为准。Hy2 需要放行的是 **UDP**；只开放同数字的 TCP 端口不够。
+如果在向导或环境变量中改过端口，以安装结尾输出为准。Hy2 需要放行的是 **UDP**；只开放同数字的 TCP 端口不够。Argo 隧道由服务器主动连接 Cloudflare，不需要放行入站端口。
 
 ## 选择证书
 
