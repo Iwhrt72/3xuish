@@ -747,7 +747,14 @@ profile_share_link() {
             + "&flow=" + ($settings.flow | encoded)
             + (if $stream.network == "xhttp" then
                  "&path=" + ($stream.xhttpSettings.path | encoded)
-                 + "&mode=" + ($stream.xhttpSettings.mode | encoded) else "" end)
+                 + "&mode=" + ($stream.xhttpSettings.mode | encoded)
+                 + (if ($stream.xhttpSettings.host // "") != "" then
+                      "&host=" + ($stream.xhttpSettings.host | encoded) else "" end)
+               elif $stream.network == "ws" then
+                 "&path=" + ($stream.wsSettings.path | encoded)
+                 + (if ($stream.wsSettings.host // "") != "" then
+                      "&host=" + ($stream.wsSettings.host | encoded) else "" end)
+               else "" end)
             + (if $stream.security == "tls" then
                  "&fp=" + ($stream.tlsSettings.fingerprint | encoded)
                  + "&alpn=" + ($stream.tlsSettings.alpn | join(",") | encoded)
@@ -1124,6 +1131,9 @@ write_node_files() {
     printf '%s\n' "$NODE_PROFILES" >"$profile_file_tmp" || return 1
     install -m 600 "$profile_file_tmp" "$profiles_file" || return 1
     jq -r '.[].link' "$profiles_file" >"$RUN_DIR/links.txt" || return 1
+    if [[ -s "$XUI_INFO_DIR/3x-ui-argo.json" ]]; then
+        jq -r '.link' "$XUI_INFO_DIR/3x-ui-argo.json" >>"$RUN_DIR/links.txt" || return 1
+    fi
     install -m 600 "$RUN_DIR/links.txt" "$links_file" || return 1
     {
         printf '============================================================\n'
@@ -1144,6 +1154,17 @@ write_node_files() {
                 "$(jq -r '.[] | select(.subscriptionOwner == true) | .label' "$profiles_file")"
         elif [[ "$SUB_STATUS" == disabled || "$SUB_STATUS" == inactive ]]; then
             printf '\n统一订阅：尚未开启，可运行 --enable-subscription 一条链接导入全部节点。\n'
+        fi
+        local argo_file="$XUI_INFO_DIR/3x-ui-argo.json"
+        if [[ -s "$argo_file" ]]; then
+            printf '\n[Argo 隧道（Cloudflare）]\n'
+            printf '模式：%s；域名：%s；本机入站：127.0.0.1:%s\n' \
+                "$(jq -r 'if .mode == "quick" then "临时" else "固定" end' "$argo_file")" \
+                "$(jq -r '.domain' "$argo_file")" "$(jq -r '.port' "$argo_file")"
+            jq -r '.link' "$argo_file"
+            if [[ "$(jq -r '.mode' "$argo_file")" == quick ]]; then
+                printf '临时隧道的域名在服务重启后会变化，脚本会自动更新统一订阅；单独导入的链接需要重新导入。\n'
+            fi
         fi
         printf '\n[节点与导入链接]\n'
         local key label port kind link primary
@@ -1500,7 +1521,8 @@ refresh_subscription_links() {
 }
 
 load_panel_context_for_api() {
-    install_deps || return 1
+    # 开机同步等后台调用传 --no-deps，避免每次都运行包管理器。
+    if [[ "${1:-}" != --no-deps ]]; then install_deps || return 1; fi
     detect_server_ip || return 1
     resolve_xray_binary || return 1
     load_existing_panel_context || return 1
@@ -1787,6 +1809,417 @@ apply_hy2_hop_profile() {
     printf '%s\n' "$NODE_PROFILES" >"$RUN_DIR/profiles.json"
 }
 
+# 18. Argo 隧道：用 Cloudflare 官方 cloudflared 把本机一个 XHTTP 入站经 Cloudflare 公开，
+# 服务器 IP 被封时仍可连接。入站只监听 127.0.0.1，并启用 VLESS Encryption，Cloudflare 看不到代理明文。
+ARGO_BIN="/usr/local/lib/3xuish/cloudflared"
+ARGO_CONF="/etc/3xuish/argo.conf"
+ARGO_ENV="/etc/3xuish/argo.env"
+ARGO_SERVICE="3xuish-argo"
+ARGO_LOG="/var/log/3xuish-argo.log"
+ARGO_RELEASE_API="https://api.github.com/repos/cloudflare/cloudflared/releases/latest"
+ARGO_INBOUND_ID=""
+
+argo_profile_file() { printf '%s\n' "$XUI_INFO_DIR/3x-ui-argo.json"; }
+
+argo_conf_value() {
+    local key value
+    [[ -f "$ARGO_CONF" ]] || return 1
+    while IFS='=' read -r key value; do
+        if [[ "$key" == "$1" && "$value" =~ ^[A-Za-z0-9.-]{1,253}$ ]]; then printf '%s\n' "$value"; return 0; fi
+    done <"$ARGO_CONF"
+    return 1
+}
+
+cloudflared_asset() {
+    case "${ARCH:-$(get_arch)}" in
+        amd64) printf 'cloudflared-linux-amd64\n' ;;
+        386) printf 'cloudflared-linux-386\n' ;;
+        arm64) printf 'cloudflared-linux-arm64\n' ;;
+        armv7) printf 'cloudflared-linux-armhf\n' ;;
+        *) fail "Cloudflare 未提供此架构的 cloudflared。"; return 1 ;;
+    esac
+}
+
+install_cloudflared() {
+    local asset release tag expected actual version tmp="${ARGO_BIN%/*}/.cloudflared-download"
+    if [[ -x "$ARGO_BIN" ]] && "$ARGO_BIN" --version >/dev/null 2>&1; then return 0; fi
+    asset=$(cloudflared_asset) || return 1
+    release=$(curl -q -fsSL --connect-timeout 10 --max-time 30 --retry 2 \
+        -H 'Accept: application/vnd.github+json' "$ARGO_RELEASE_API") || {
+        fail "无法从 GitHub 获取 cloudflared 版本信息。"; return 1;
+    }
+    tag=$(jq -er 'select(.draft == false and .prerelease == false) | .tag_name' <<<"$release") || {
+        fail "GitHub 未返回 cloudflared 稳定版本。"; return 1;
+    }
+    [[ "$tag" =~ ^[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,3}$ ]] || { fail "cloudflared 版本号格式异常：${tag}"; return 1; }
+    # 官方在发布说明中列出 SHA256；缺失时使用 GitHub 记录的资产摘要。
+    expected=$(jq -r '.body // ""' <<<"$release" | sed -nE "s/^[[:space:]]*${asset}:[[:space:]]*([0-9a-f]{64})[[:space:]]*\$/\1/p")
+    expected="${expected%%$'\n'*}"
+    if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+        expected=$(jq -r --arg a "$asset" '.assets[] | select(.name == $a) | (.digest // "") | sub("^sha256:"; "")' <<<"$release")
+    fi
+    [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || { fail "未找到 cloudflared 官方校验值，已停止。"; return 1; }
+    install -d -m 755 "${ARGO_BIN%/*}" || return 1
+    log_info "正在下载 cloudflared ${tag}（${asset}）..."
+    curl -q -fsSL --connect-timeout 10 --max-time 300 --retry 2 --max-filesize 209715200 -o "$tmp" \
+        "https://github.com/cloudflare/cloudflared/releases/download/$tag/$asset" || {
+        rm -f -- "$tmp"; fail "cloudflared 下载失败。"; return 1;
+    }
+    actual=$(sha256sum "$tmp") || return 1
+    [[ "${actual%% *}" == "$expected" ]] || { rm -f -- "$tmp"; fail "cloudflared SHA-256 与官方校验值不符，已停止。"; return 1; }
+    chmod 755 "$tmp" || return 1
+    version=$("$tmp" --version 2>/dev/null) || { rm -f -- "$tmp"; fail "cloudflared 无法在本机运行。"; return 1; }
+    mv -f -- "$tmp" "$ARGO_BIN" || return 1
+    log_info "cloudflared 已通过 SHA-256 校验：${version%%$'\n'*}"
+}
+
+pick_free_local_port() {
+    local port count
+    for _ in {1..50}; do
+        port=$((20000 + RANDOM % 40000))
+        [[ "$port" != "${1:-}" && -z "$(ss -H -lnt "sport = :${port}")" ]] || continue
+        count=$(sqlite3 -readonly "$XUI_DB_PATH" "SELECT count(*) FROM inbounds WHERE port=$port;") || return 1
+        [[ "$count" == 0 ]] || continue
+        printf '%s\n' "$port"
+        return 0
+    done
+    fail "未找到空闲的本地端口。"
+}
+
+argo_tunnel_args() {
+    local mode="$1" port="$2" metrics="$3"
+    # 默认停止前会等待 30 秒排空连接；缩短到 3 秒，重启和关闭不必长时间等待。
+    printf 'tunnel --no-autoupdate --edge-ip-version auto --protocol http2 --grace-period 3s --metrics 127.0.0.1:%s' "$metrics"
+    if [[ "$mode" == quick ]]; then printf ' --url http://127.0.0.1:%s\n' "$port"; else printf ' run\n'; fi
+}
+
+install_argo_service() {
+    local mode="$1" port="$2" metrics="$3" args env_line
+    args=$(argo_tunnel_args "$mode" "$port" "$metrics")
+    env_line="XUI_INSTALL_DIR=$XUI_INSTALL_DIR XUI_DB_PATH=$XUI_DB_PATH XUI_INFO_DIR=$XUI_INFO_DIR XUI_SERVICE=$XUI_SERVICE"
+    if hy2_hop_has_systemd; then
+        {
+            printf '[Unit]\nDescription=3xuish Argo tunnel (cloudflared)\nWants=network-online.target\n'
+            printf 'After=network-online.target %s.service\n\n[Service]\nType=simple\n' "$XUI_SERVICE"
+            printf 'EnvironmentFile=-%s\nExecStart=%s %s\n' "$ARGO_ENV" "$ARGO_BIN" "$args"
+            if [[ "$mode" == quick ]]; then
+                # 临时隧道每次启动域名都会变；启动后自动把新域名写回面板与订阅。
+                printf 'Environment=%s\nExecStartPost=-/bin/bash %s --argo sync\nTimeoutStartSec=300\n' \
+                    "$env_line" "$LOCAL_INSTALLER_COPY"
+            fi
+            printf 'Restart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n'
+        } >"/etc/systemd/system/$ARGO_SERVICE.service" || return 1
+        systemctl daemon-reload || return 1
+        systemctl enable "$ARGO_SERVICE" >/dev/null 2>&1 || return 1
+        systemctl restart "$ARGO_SERVICE" || return 1
+    elif hy2_hop_has_openrc; then
+        {
+            printf '#!/sbin/openrc-run\ndescription="3xuish Argo tunnel (cloudflared)"\n'
+            printf 'command="%s"\ncommand_args="%s"\ncommand_background=true\n' "$ARGO_BIN" "$args"
+            printf 'pidfile="/run/%s.pid"\noutput_log="%s"\nerror_log="%s"\n' "$ARGO_SERVICE" "$ARGO_LOG" "$ARGO_LOG"
+            printf 'depend() {\n    need net\n    after %s\n}\n' "$XUI_SERVICE"
+            printf 'start_pre() {\n    if [ -r %s ]; then set -a; . %s; set +a; fi\n}\n' "$ARGO_ENV" "$ARGO_ENV"
+            if [[ "$mode" == quick ]]; then
+                printf 'start_post() {\n    ( sleep 2; env %s /bin/bash %s --argo sync >>%s 2>&1 ) &\n}\n' \
+                    "$env_line" "$LOCAL_INSTALLER_COPY" "$ARGO_LOG"
+            fi
+        } >"/etc/init.d/$ARGO_SERVICE" || return 1
+        chmod 755 "/etc/init.d/$ARGO_SERVICE" || return 1
+        rc-update add "$ARGO_SERVICE" default >/dev/null 2>&1 || return 1
+        rc-service "$ARGO_SERVICE" restart >/dev/null 2>&1 || return 1
+    else
+        log_warn "未检测到 systemd 或 OpenRC：隧道已在后台启动，但重启后不会自动恢复。"
+        local token=""
+        if [[ -r "$ARGO_ENV" ]]; then token=$(sed -n 's/^TUNNEL_TOKEN=//p' "$ARGO_ENV"); fi
+        # shellcheck disable=SC2086
+        TUNNEL_TOKEN="$token" nohup "$ARGO_BIN" $args </dev/null >>"$ARGO_LOG" 2>&1 &
+        printf '%s\n' "$!" >"/run/$ARGO_SERVICE.pid" || return 1
+    fi
+}
+
+remove_argo_service() {
+    local pid
+    if hy2_hop_has_systemd && [[ -f "/etc/systemd/system/$ARGO_SERVICE.service" ]]; then
+        systemctl disable --now "$ARGO_SERVICE" >/dev/null 2>&1 || true
+        rm -f -- "/etc/systemd/system/$ARGO_SERVICE.service"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    elif [[ -f "/etc/init.d/$ARGO_SERVICE" ]]; then
+        rc-service "$ARGO_SERVICE" stop >/dev/null 2>&1 || true
+        rc-update del "$ARGO_SERVICE" default >/dev/null 2>&1 || true
+        rm -f -- "/etc/init.d/$ARGO_SERVICE"
+    elif [[ -f "/run/$ARGO_SERVICE.pid" ]]; then
+        pid=$(cat "/run/$ARGO_SERVICE.pid")
+        if [[ "$pid" =~ ^[0-9]+$ && "$(readlink "/proc/$pid/exe" 2>/dev/null)" == "$ARGO_BIN" ]]; then
+            kill "$pid" 2>/dev/null || true
+            for _ in {1..20}; do [[ -d "/proc/$pid" ]] || break; sleep 0.5; done
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f -- "/run/$ARGO_SERVICE.pid"
+    fi
+}
+
+argo_quick_hostname() {
+    local metrics="$1" body host
+    for _ in {1..45}; do
+        body=$(curl -q -fsS --noproxy '*' --max-time 3 "http://127.0.0.1:$metrics/quicktunnel" 2>/dev/null) || body=""
+        host=$(jq -r '.hostname // ""' <<<"$body" 2>/dev/null) || host=""
+        if [[ "$host" =~ ^[a-z0-9-]+\.trycloudflare\.com$ ]]; then printf '%s\n' "$host"; return 0; fi
+        sleep 2
+    done
+    return 1
+}
+
+argo_wait_ready() {
+    for _ in {1..45}; do
+        [[ "$(curl -q -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$1/ready")" == 200 ]] && return 0
+        sleep 2
+    done
+    return 1
+}
+
+# 经 Cloudflare 访问入站路径：Cloudflare 自身的错误页（502–504、520–530）表示还没连到本机。
+# 新域名优先用 DoH 解析，避免本机 DNS 缓存“域名不存在”的结果而影响后续连接。
+argo_edge_reachable() {
+    local host="$1" path="$2" code="" doh=()
+    if curl -q -s --doh-url https://1.1.1.1/dns-query -o /dev/null --max-time 5 https://1.1.1.1/ 2>/dev/null; then
+        doh=(--doh-url https://1.1.1.1/dns-query)
+    fi
+    for _ in {1..30}; do
+        code=$(curl -q -s "${doh[@]}" -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 "https://$host$path" 2>/dev/null) || code=000
+        if [[ "$code" =~ ^[1-4][0-9][0-9]$ ]]; then ARGO_EDGE_CODE="$code"; return 0; fi
+        sleep 3
+    done
+    ARGO_EDGE_CODE="$code"
+    return 1
+}
+
+argo_rollback() {
+    remove_argo_service
+    if [[ -n "$ARGO_INBOUND_ID" ]]; then
+        api_request POST "/panel/api/inbounds/del/$ARGO_INBOUND_ID" '{}' >/dev/null ||
+            log_warn "Argo 入站 ID=$ARGO_INBOUND_ID 删除失败，请在面板删除。"
+        api_request POST '/panel/api/server/restartXrayService' '{}' >/dev/null || true
+        ARGO_INBOUND_ID=""
+    fi
+    rm -f -- "$ARGO_CONF" "$ARGO_ENV" "$(argo_profile_file)"
+    remove_local_installer_copy_if_unused
+}
+
+# 生成 Argo 资料：domain 为隧道域名，客户端连接 Cloudflare 的 443 端口。
+argo_profile_json() {
+    local domain="$1"
+    jq -c --arg domain "$domain" '
+        .domain = $domain |
+        .clientOutbound.settings.address = $domain |
+        .clientOutbound.streamSettings.tlsSettings.serverName = $domain |
+        .clientOutbound.streamSettings.wsSettings.host = $domain' <<<"$2"
+}
+
+argo_write_profile() {
+    local profile="$1" link
+    link=$(profile_share_link "$profile") || return 1
+    jq --arg link "$link" '.link = $link' <<<"$profile" >"$RUN_DIR/argo.json" || return 1
+    install -m 600 "$RUN_DIR/argo.json" "$(argo_profile_file)"
+}
+
+argo_refresh_outputs() {
+    NODE_PROFILES=$(jq -c '.' "$XUI_INFO_DIR/3x-ui-node-profiles.json") || return 1
+    printf '%s\n' "$NODE_PROFILES" >"$RUN_DIR/profiles.json" || return 1
+    load_ports_from_profiles
+    write_node_files || return 1
+    refresh_subscription_links || log_warn "统一订阅中的链接未能更新；可运行 --enable-subscription 重新同步。"
+}
+
+argo_setup() {
+    local mode="$1" token="${ARGO_TOKEN:-}" domain="${ARGO_DOMAIN:-}" port metrics nonce uuid path sub email tag
+    local payload response candidate profile host
+    [[ -s "$XUI_INFO_DIR/3x-ui-node-profiles.json" ]] || { fail "未找到本脚本的节点资料，Argo 隧道需要先完成四节点部署。"; return 1; }
+    if [[ -f "$ARGO_CONF" ]]; then
+        fail "Argo 隧道已开启（$(argo_conf_value MODE)）；更换前请先关闭：--argo off。"; return 1
+    fi
+    if [[ "$mode" == fixed ]]; then
+        printf '固定隧道：在 Cloudflare Zero Trust → 网络 → 隧道 创建隧道，复制令牌；公共主机名稍后按提示填写。\n'
+        [[ -n "$token" ]] || prompt_read "隧道令牌（token）: " token
+        [[ -n "$domain" ]] || prompt_read "公共主机名（例如 argo.example.com）: " domain
+        token="${token//[[:space:]]/}"
+        [[ "$token" =~ ^[A-Za-z0-9+/=_-]{50,2048}$ ]] || { fail "隧道令牌格式无效。"; return 1; }
+        valid_domain "$domain" || { fail "公共主机名格式无效。"; return 1; }
+    fi
+    load_panel_context_for_api || return 1
+    api_init || return 1
+    install_cloudflared || return 1
+    if [[ "$mode" == quick ]]; then install_local_installer_copy || return 1; fi
+    VLESS_ENC_TYPE=1
+    generate_vlessenc_keys || return 1
+    port=$(pick_free_local_port) || return 1
+    metrics=$(pick_free_local_port "$port") || return 1
+    install -d -m 700 "${ARGO_CONF%/*}" || return 1
+    printf 'MODE=%s\nPORT=%s\nMETRICS=%s\nDOMAIN=%s\n' "$mode" "$port" "$metrics" "${domain:-}" >"$ARGO_CONF" || return 1
+    chmod 600 "$ARGO_CONF" || return 1
+    if [[ "$mode" == fixed ]]; then
+        (umask 077; printf 'TUNNEL_TOKEN=%s\n' "$token" >"$ARGO_ENV") || { argo_rollback; return 1; }
+    fi
+    run_without_lock_fd install_argo_service "$mode" "$port" "$metrics" || { argo_rollback; fail "Argo 服务启动失败，日志：$ARGO_LOG"; return 1; }
+    if [[ "$mode" == quick ]]; then
+        log_info "正在申请 Cloudflare 临时隧道域名..."
+        host=$(argo_quick_hostname "$metrics") || { argo_rollback; fail "未能获取临时隧道域名，日志：$ARGO_LOG"; return 1; }
+        argo_wait_ready "$metrics" || { argo_rollback; fail "临时隧道未能连接 Cloudflare，日志：$ARGO_LOG"; return 1; }
+    else
+        log_info "正在等待隧道连接 Cloudflare..."
+        argo_wait_ready "$metrics" || { argo_rollback; fail "隧道未能连接 Cloudflare，请核对令牌；日志：$ARGO_LOG"; return 1; }
+        host="$domain"
+    fi
+    log_info "隧道域名：$host"
+
+    nonce=$(gen_random_str 16) uuid=$(gen_uuid) path="/$(gen_random_str 12)" sub=$(gen_random_str 20)
+    email="3xuish_argo_$nonce" tag="3xuish-$nonce-Argo"
+    payload=$(jq -cn --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" --arg email "$email" \
+        --arg sub "$sub" --arg path "$path" --arg dec "$VLESS_DECRYPTION" --arg host "$host" '{
+        up: 0, down: 0, total: 0, remark: "3xuish-Argo", enable: true, expiryTime: 0,
+        listen: "127.0.0.1", port: $port, protocol: "vless", tag: $tag,
+        settings: ({clients: [{id: $uuid, flow: "xtls-rprx-vision", email: $email, limitIp: 0, totalGB: 0,
+            expiryTime: 0, enable: true, tgId: 0, subId: $sub, comment: "", reset: 0}],
+            decryption: $dec, encryption: "none"} | tojson),
+        # 实测 XHTTP 无法穿过 cloudflared 的本机转发（请求挂起至超时），WebSocket 可以。
+        streamSettings: ({network: "ws", security: "none",
+            wsSettings: {path: $path, host: "", headers: {}}, sockopt: {tcpWindowClamp: 0},
+            externalProxy: [{forceTls: "tls", dest: $host, port: 443, remark: ""}]} | tojson),
+        sniffing: ({enabled: false, destOverride: ["http", "tls", "quic"], metadataOnly: false, routeOnly: true} | tojson)
+    }') || { argo_rollback; return 1; }
+    response=$(api_request POST '/panel/api/inbounds/add' "$payload") || { argo_rollback; fail "创建 Argo 入站时面板无响应。"; return 1; }
+    ARGO_INBOUND_ID=$(jq -er 'select(.success == true) | .obj.id' <<<"$response") || {
+        argo_rollback; fail "面板拒绝创建 Argo 入站：$(jq -r '.msg // "未知原因"' <<<"$response" 2>/dev/null)"; return 1;
+    }
+    candidate="$RUN_DIR/xray-argo-candidate.json"
+    if ! api_request GET '/panel/api/server/getConfigJson' | jq -er '.obj | objects' >"$candidate" ||
+       ! (cd "$XUI_INSTALL_DIR" && "$XRAY_BIN" run -test -c "$candidate") >"$RUN_DIR/xray-argo-check.log" 2>&1; then
+        argo_rollback; fail "加入 Argo 入站后的 Xray 配置未通过校验，已撤销。"; return 1
+    fi
+    response=$(api_request POST '/panel/api/server/restartXrayService' '{}') || { argo_rollback; fail "面板未能重启 Xray。"; return 1; }
+    for _ in {1..20}; do
+        [[ "$(ss -H -lntp "sport = :${port}")" == *xray* ]] && break
+        sleep 1
+    done
+    [[ "$(ss -H -lntp "sport = :${port}")" == *xray* ]] || { argo_rollback; fail "Argo 入站未在 127.0.0.1:${port} 监听。"; return 1; }
+
+    profile=$(jq -cn --arg mode "$mode" --argjson port "$port" --arg uuid "$uuid" --arg email "$email" \
+        --arg tag "$tag" --arg path "$path" --arg enc "$VLESS_ENCRYPTION" '{
+        key: "argo", label: "Argo（Cloudflare 隧道）", remark: "3xuish-Argo", mode: $mode, port: $port,
+        credential: $uuid, email: $email, tag: $tag,
+        clientOutbound: {protocol: "vless",
+            settings: {address: "", port: 443, id: $uuid, encryption: $enc, flow: "xtls-rprx-vision"},
+            # WebSocket 需要 HTTP/1.1 升级，ALPN 只声明 http/1.1。
+            streamSettings: {network: "ws", security: "tls",
+                wsSettings: {path: $path, host: ""},
+                tlsSettings: {serverName: "", fingerprint: "chrome", alpn: ["http/1.1"]}}}
+    }') || { argo_rollback; return 1; }
+    profile=$(argo_profile_json "$host" "$profile") || { argo_rollback; return 1; }
+    argo_write_profile "$profile" || { argo_rollback; return 1; }
+    if [[ "$mode" == fixed ]]; then
+        printf '\n请在 Cloudflare 隧道的“公共主机名”中添加：%s → 服务类型 HTTP，URL 127.0.0.1:%s\n' "$host" "$port"
+        if [[ "${AUTO_YES:-0}" != 1 ]]; then prompt_read "添加完成后按回车继续检查连通性..." payload; fi
+    fi
+    log_info "正在经 Cloudflare 检查隧道连通性..."
+    if argo_edge_reachable "$host" "$path"; then
+        log_info "Cloudflare 已能连到本机 Argo 入站（HTTP ${ARGO_EDGE_CODE}）。"
+    else
+        log_warn "暂未经 Cloudflare 连到本机入站（HTTP ${ARGO_EDGE_CODE:-000}）；固定隧道请核对公共主机名，临时域名可能需要一两分钟生效。"
+    fi
+    ARGO_INBOUND_ID=""
+    argo_refresh_outputs || return 1
+    printf '\n%b[Argo 隧道]%b %s\n%s\n' "$CYAN" "$PLAIN" "$host" "$(jq -r '.link' "$(argo_profile_file)")"
+    print_qr "$(jq -r '.link' "$(argo_profile_file)")" || true
+    if [[ "$mode" == quick ]]; then
+        log_warn "临时隧道仅供测试，域名在服务重启后会变化；脚本会自动更新统一订阅，单独导入的链接需重新导入。"
+    fi
+}
+
+argo_inbound_id() {
+    local tag
+    tag=$(jq -r '.tag // ""' "$(argo_profile_file)" 2>/dev/null) || return 1
+    inbound_id_by_tag "$tag"
+}
+
+inbound_id_by_tag() {
+    local tag="$1" id
+    [[ "$tag" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    id=$(sqlite3 -readonly "$XUI_DB_PATH" "SELECT id FROM inbounds WHERE tag='$tag';") || return 1
+    [[ "$id" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$id"
+}
+
+# 临时隧道重启后由服务调用：读取新域名，写回面板入站、资料文件和统一订阅。
+argo_sync() {
+    local mode metrics host current id response inbound payload profile
+    mode=$(argo_conf_value MODE) || { log_info "Argo 隧道未开启。"; return 0; }
+    [[ "$mode" == quick && -s "$(argo_profile_file)" ]] || return 0
+    metrics=$(argo_conf_value METRICS) || { fail "Argo 配置缺少 metrics 端口。"; return 1; }
+    host=$(argo_quick_hostname "$metrics") || { fail "未能获取 Argo 临时隧道域名。"; return 1; }
+    current=$(jq -r '.domain // ""' "$(argo_profile_file)")
+    if [[ "$host" == "$current" ]]; then log_info "Argo 临时域名未变化：$host"; return 0; fi
+    load_panel_context_for_api --no-deps || return 1
+    for _ in {1..30}; do
+        api_init >/dev/null 2>&1 && break
+        sleep 2
+    done
+    [[ "$API_READY" == 1 ]] || { fail "面板 API 不可用，Argo 域名未更新。"; return 1; }
+    id=$(argo_inbound_id) || { fail "面板中未找到 Argo 入站。"; return 1; }
+    response=$(api_request GET "/panel/api/inbounds/get/$id") || return 1
+    inbound=$(jq -ce 'select(.success == true) | .obj | objects' <<<"$response") || return 1
+    payload=$(jq -c --arg host "$host" '
+        def as_object: if type == "string" then fromjson else . end;
+        def as_string: if type == "string" then . else tojson end;
+        del(.clientStats) | .settings |= as_string | .sniffing |= as_string |
+        .streamSettings |= (as_object | .externalProxy = [{forceTls: "tls", dest: $host, port: 443, remark: ""}] | tojson)' \
+        <<<"$inbound") || return 1
+    response=$(api_request POST "/panel/api/inbounds/update/$id" "$payload") || return 1
+    jq -e '.success == true' >/dev/null <<<"$response" || { fail "面板拒绝更新 Argo 入站。"; return 1; }
+    profile=$(argo_profile_json "$host" "$(jq -c '.' "$(argo_profile_file)")") || return 1
+    argo_write_profile "$profile" || return 1
+    argo_refresh_outputs || return 1
+    log_info "Argo 临时域名已更新：${current:-无} → $host"
+}
+
+argo_off() {
+    local id
+    if [[ ! -f "$ARGO_CONF" && ! -s "$(argo_profile_file)" ]]; then log_info "Argo 隧道未开启。"; return 0; fi
+    remove_argo_service
+    if [[ -s "$(argo_profile_file)" ]] && id=$(argo_inbound_id); then
+        load_panel_context_for_api || return 1
+        api_init || return 1
+        api_request POST "/panel/api/inbounds/del/$id" '{}' | jq -e '.success == true' >/dev/null || {
+            fail "面板未能删除 Argo 入站 ID=${id}；隧道服务已停止，请在面板中删除该入站后重试。"; return 1;
+        }
+        api_request POST '/panel/api/server/restartXrayService' '{}' >/dev/null || true
+    fi
+    rm -f -- "$ARGO_CONF" "$ARGO_ENV" "$(argo_profile_file)" "$ARGO_BIN"
+    rmdir -- "${ARGO_CONF%/*}" 2>/dev/null || true
+    remove_local_installer_copy_if_unused
+    if [[ -s "$XUI_INFO_DIR/3x-ui-node-profiles.json" ]]; then argo_refresh_outputs || return 1; fi
+    log_info "已关闭 Argo 隧道，删除了隧道服务、cloudflared 和 Argo 入站。"
+}
+
+argo_status() {
+    local mode metrics state="未运行"
+    if ! mode=$(argo_conf_value MODE); then log_info "Argo 隧道未开启。"; return 0; fi
+    metrics=$(argo_conf_value METRICS) || metrics=""
+    if [[ -n "$metrics" && "$(curl -q -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$metrics/ready")" == 200 ]]; then
+        state="已连接 Cloudflare"
+    fi
+    log_info "Argo 隧道：$([[ "$mode" == quick ]] && printf '临时' || printf '固定')；状态：${state}；域名：$(jq -r '.domain // "未知"' "$(argo_profile_file)" 2>/dev/null)"
+    if [[ -s "$(argo_profile_file)" ]]; then jq -r '.link' "$(argo_profile_file)"; fi
+}
+
+argo_command() {
+    case "${1:-}" in
+        quick|fixed) argo_setup "$1" ;;
+        off) argo_off ;;
+        sync) argo_sync ;;
+        status) argo_status ;;
+        *) fail "--argo 只接受 quick、fixed、off、status。"; return 1 ;;
+    esac
+}
+
 # 重装/卸载不会处理这些独立服务；提前提示，避免留下指向旧端口的规则或隧道。
 print_extra_services_notice() {
     local extras=()
@@ -1845,9 +2278,9 @@ hy2_hop_command() {
             >"$HY2_HOP_CONF" || return 1
         chmod 600 "$HY2_HOP_CONF" || return 1
         write_hy2_hop_script || return 1
-        if ! install_hy2_hop_service || ! /bin/sh "$HY2_HOP_SCRIPT" active; then
+        if ! run_without_lock_fd install_hy2_hop_service || ! /bin/sh "$HY2_HOP_SCRIPT" active; then
             remove_hy2_hop_service
-            if [[ -n "$old_conf" ]]; then printf '%s\n' "$old_conf" >"$HY2_HOP_CONF"; install_hy2_hop_service || true
+            if [[ -n "$old_conf" ]]; then printf '%s\n' "$old_conf" >"$HY2_HOP_CONF"; run_without_lock_fd install_hy2_hop_service || true
             else rm -f -- "$HY2_HOP_CONF"; fi
             fail "端口重定向规则未能生效，已撤销本次修改。"; return 1
         fi
@@ -1856,7 +2289,7 @@ hy2_hop_command() {
     if ! update_hy2_inbound_hop "$id" "$ports"; then
         if [[ -n "$ports" && -n "$old_conf" ]]; then
             printf '%s\n' "$old_conf" >"$HY2_HOP_CONF"
-            install_hy2_hop_service || log_warn "恢复原端口跳跃规则失败，请运行 --hy2-hop status 检查。"
+            run_without_lock_fd install_hy2_hop_service || log_warn "恢复原端口跳跃规则失败，请运行 --hy2-hop status 检查。"
         elif [[ -n "$ports" ]]; then
             remove_hy2_hop_service
             rm -f -- "$HY2_HOP_CONF"
@@ -1866,7 +2299,7 @@ hy2_hop_command() {
     if [[ -z "$ports" ]]; then
         remove_hy2_hop_service
         rm -f -- "$HY2_HOP_CONF" "$HY2_HOP_SCRIPT"
-        rmdir -- "${HY2_HOP_CONF%/*}" 2>/dev/null || true
+        rmdir -- "${HY2_HOP_CONF%/*}" "${HY2_HOP_SCRIPT%/*}" 2>/dev/null || true
         log_info "已关闭 Hy2 端口跳跃并删除重定向规则。"
     fi
     wait_hy2_listening "$hy2_port" || return 1
@@ -2262,14 +2695,16 @@ xray_wait_healthy() {
     return 1
 }
 
-# 重启时不把维护锁传给新面板进程，否则常驻面板会一直持有锁，后续维护操作都会被拒绝。
-xray_restart_panel() {
+# 启动常驻进程时不把维护锁传下去，否则面板或隧道会一直持有锁，后续维护操作都会被拒绝。
+run_without_lock_fd() {
     if [[ -n "${MAINTENANCE_LOCK_FD:-}" ]]; then
-        (exec {MAINTENANCE_LOCK_FD}>&-; restart_panel)
+        (exec {MAINTENANCE_LOCK_FD}>&-; "$@")
     else
-        restart_panel
+        "$@"
     fi
 }
+
+xray_restart_panel() { run_without_lock_fd restart_panel; }
 
 xray_install_file() {
     local source="$1" target="$2"
@@ -2368,25 +2803,41 @@ xray_auto_update_enabled() {
     [[ "$table" == *"$XRAY_AUTO_UPDATE_MARK"* ]]
 }
 
+# 定时任务和 Argo 服务运行本地固定副本，不在每次执行时下载远程脚本。
+LOCAL_INSTALLER_COPY="$XRAY_AUTO_UPDATE_DIR/install.sh"
+install_local_installer_copy() {
+    local name value
+    [[ -f "$INSTALLER_SOURCE_FILE" && -r "$INSTALLER_SOURCE_FILE" ]] || {
+        fail "此功能需要先将脚本保存为文件：curl -fLso /tmp/3xuish-install.sh $REPO_RAW_URL && bash /tmp/3xuish-install.sh"
+        return 1
+    }
+    # 这些值会原样写入 crontab 或服务文件，只接受路径常用字符（crontab 会把 % 当作换行）。
+    for name in XUI_INSTALL_DIR XUI_DB_PATH XUI_INFO_DIR XUI_SERVICE; do
+        value="${!name}"
+        [[ "$value" =~ ^[A-Za-z0-9/._-]+$ ]] || { fail "${name} 含有不支持的字符：${value}"; return 1; }
+    done
+    bash -n "$INSTALLER_SOURCE_FILE" || { fail "脚本语法检查失败。"; return 1; }
+    install -d -m 755 "$XRAY_AUTO_UPDATE_DIR" || return 1
+    # 菜单运行时源文件就是这份副本本身，无需复制。
+    if [[ "$(readlink -f -- "$INSTALLER_SOURCE_FILE")" != "$(readlink -f -- "$LOCAL_INSTALLER_COPY" 2>/dev/null)" ]]; then
+        install -m 700 "$INSTALLER_SOURCE_FILE" "$LOCAL_INSTALLER_COPY.tmp" || return 1
+        mv -f -- "$LOCAL_INSTALLER_COPY.tmp" "$LOCAL_INSTALLER_COPY" || return 1
+    fi
+}
+
+# 只有自动更新和 Argo 临时隧道都不再使用时才删除副本。
+remove_local_installer_copy_if_unused() {
+    if xray_auto_update_enabled || [[ -f "${ARGO_CONF:-/etc/3xuish/argo.conf}" ]]; then return 0; fi
+    rm -f -- "$LOCAL_INSTALLER_COPY"
+    rmdir -- "$XRAY_AUTO_UPDATE_DIR" 2>/dev/null || true
+}
+
 enable_xray_auto_update() {
-    local name value minute hour table line copy="$XRAY_AUTO_UPDATE_DIR/install.sh"
+    local minute hour table line copy="$LOCAL_INSTALLER_COPY"
     command -v crontab >/dev/null 2>&1 || {
         fail "未找到 crontab，请先安装并启动 cron 服务后重试。"; return 1;
     }
-    [[ -f "$INSTALLER_SOURCE_FILE" && -r "$INSTALLER_SOURCE_FILE" ]] || {
-        fail "自动更新需要先将脚本保存为文件：curl -fLso /tmp/3xuish-install.sh $REPO_RAW_URL && bash /tmp/3xuish-install.sh"
-        return 1
-    }
-    # 这些值会原样写入 crontab，只接受路径常用字符（crontab 会把 % 当作换行）。
-    for name in XUI_INSTALL_DIR XUI_DB_PATH XUI_INFO_DIR XUI_SERVICE; do
-        value="${!name}"
-        [[ "$value" =~ ^[A-Za-z0-9/._-]+$ ]] || { fail "${name} 含有定时任务不支持的字符：${value}"; return 1; }
-    done
-    bash -n "$INSTALLER_SOURCE_FILE" || { fail "脚本语法检查失败，未开启自动更新。"; return 1; }
-    # 定时任务运行本地固定副本，不在每次执行时下载远程脚本。
-    install -d -m 755 "$XRAY_AUTO_UPDATE_DIR" || return 1
-    install -m 700 "$INSTALLER_SOURCE_FILE" "$copy.tmp" || return 1
-    mv -f -- "$copy.tmp" "$copy" || return 1
+    install_local_installer_copy || return 1
     minute=$((RANDOM % 60))
     hour=$((3 + RANDOM % 3))
     line="$minute $hour * * * /usr/bin/env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -2414,8 +2865,7 @@ disable_xray_auto_update() {
         fi
     fi
     if xray_auto_update_enabled; then fail "仍检测到自动更新定时任务，请执行 crontab -l 检查。"; return 1; fi
-    rm -f -- "$XRAY_AUTO_UPDATE_DIR/install.sh"
-    rmdir -- "$XRAY_AUTO_UPDATE_DIR" 2>/dev/null || true
+    remove_local_installer_copy_if_unused
     log_info "已关闭 Xray 自动更新；当前内核保持不变，日志 ${XRAY_AUTO_UPDATE_LOG} 和旧内核备份保留。"
 }
 
@@ -2592,6 +3042,7 @@ print_usage() {
   --enable-subscription      本脚本的节点共用一条订阅链接（含 Clash/Mihomo 格式）
   --show-links               显示订阅、节点链接及二维码（只读）
   --hy2-hop 范围|off|status  Hy2 端口跳跃，例如 --hy2-hop 20000-50000
+  --argo quick|fixed|off|status  Cloudflare Argo 隧道（临时或固定；固定可用 ARGO_TOKEN/ARGO_DOMAIN）
   --update-xray              更新 Xray 内核到官方最新稳定版（启动失败自动恢复）
   --enable-xray-auto-update  开启每日自动检查并更新 Xray 内核
   --disable-xray-auto-update 关闭 Xray 自动更新
@@ -2687,9 +3138,10 @@ interactive_menu() {
             '  15) 开启统一订阅（一条链接导入全部节点）' \
             '  16) 查看订阅、节点链接与二维码' \
             '  17) Hy2 端口跳跃（开启、修改或关闭）' \
+            '  18) Argo 隧道（Cloudflare，IP 被封时备用）' \
             '  0) 退出'
         choice=""
-        if ! menu_read_choice choice '请选择 [0-17]：'; then
+        if ! menu_read_choice choice '请选择 [0-18]：'; then
             printf '\n输入已结束，退出菜单。\n'
             return 0
         fi
@@ -2727,8 +3179,22 @@ interactive_menu() {
                 if ! menu_read_choice domain 'UDP 端口范围（如 20000-50000；off 关闭；留空取消）：'; then return 0; fi
                 if [[ -n "$domain" ]]; then menu_run_action --hy2-hop "$domain"; fi
                 ;;
+            18)
+                menu_run_action --argo status
+                printf '%s\n' '  1) 临时隧道（trycloudflare.com，免账号，域名重启后会变）' \
+                    '  2) 固定隧道（需要 Cloudflare 账号与托管域名）' '  3) 关闭 Argo 隧道'
+                domain=""
+                if ! menu_read_choice domain '请选择 [1-3，留空返回]：'; then return 0; fi
+                case "$domain" in
+                    1) menu_run_action --argo quick ;;
+                    2) menu_run_action --argo fixed ;;
+                    3) menu_run_action --argo off ;;
+                    '') ;;
+                    *) log_warn "请输入 1–3。" ;;
+                esac
+                ;;
             '') ;;
-            *) log_warn "请输入 0–17。" ;;
+            *) log_warn "请输入 0–18。" ;;
         esac
     done
 }
@@ -2745,6 +3211,10 @@ main() {
             [[ $# -le 2 ]] || { fail "--switch-domain 只接受一个域名。"; return 1; } ;;
         --hy2-hop)
             [[ $# -eq 2 ]] || { fail "--hy2-hop 需要一个参数：端口范围、off 或 status。"; return 1; } ;;
+        --argo)
+            [[ $# -eq 2 && "$2" =~ ^(quick|fixed|off|status|sync)$ ]] || {
+                fail "--argo 需要一个参数：quick、fixed、off 或 status。"; return 1;
+            } ;;
         --update-xray)
             [[ $# -eq 1 || ( $# -eq 2 && "$2" == --auto ) ]] || {
                 fail "--update-xray 只接受可选的 --auto。"; return 1;
@@ -2774,6 +3244,13 @@ main() {
                 hy2_hop_command status
             else
                 acquire_maintenance_lock; hy2_hop_command "$2"
+            fi
+            ;;
+        --argo)
+            if [[ "$2" == status ]]; then
+                argo_command status
+            else
+                acquire_maintenance_lock; argo_command "$2"
             fi
             ;;
         --enable-xray-auto-update) enable_xray_auto_update ;;
