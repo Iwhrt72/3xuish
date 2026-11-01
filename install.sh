@@ -221,6 +221,20 @@ install_deps() {
             apt-get update -y -q && apt-get install -y -q curl jq socat openssl sqlite3 cron tar ca-certificates iproute2
             ;;
     esac
+    install_qrencode_optional
+}
+
+# 二维码只是便利功能：安装失败（如 RHEL 未启用 EPEL）不影响部署。
+install_qrencode_optional() {
+    command -v qrencode >/dev/null 2>&1 && return 0
+    case "${RELEASE:-}" in
+        centos | rhel | almalinux | rocky | fedora | amzn | ol)
+            if command -v dnf >/dev/null 2>&1; then dnf install -y -q qrencode; else yum install -y -q qrencode; fi ;;
+        alpine) apk add --no-cache libqrencode-tools ;;
+        arch | manjaro) pacman -S --noconfirm --needed qrencode ;;
+        *) apt-get install -y -q qrencode ;;
+    esac >/dev/null 2>&1 || true
+    return 0
 }
 
 # 4. 获取服务器公网 IPv4 地址
@@ -1164,6 +1178,50 @@ write_node_files() {
 print_summary() {
     log_info "部署成功：四个节点已创建且 Xray 正在监听。"
     cat "$XUI_INFO_DIR/3x-ui-nodes-info.txt"
+    load_subscription_urls "$XUI_INFO_DIR/3x-ui-node-profiles.json"
+    if [[ "$SUB_STATUS" == ok ]]; then
+        printf '\n手机扫码导入统一订阅：\n'
+        print_qr "$SUB_URL" || true
+    fi
+    printf '\n查看每个节点的二维码：运行 --show-links，或在菜单选择 16。\n'
+}
+
+# 2. 二维码：超过约 550 个字符的链接在普通终端里扫不出来，改为提示复制链接或用订阅。
+QR_MAX_LENGTH=550
+print_qr() {
+    local text="$1"
+    command -v qrencode >/dev/null 2>&1 || {
+        printf '（未安装 qrencode，无法显示二维码；Debian/Ubuntu：apt-get install -y qrencode）\n'; return 1;
+    }
+    if ((${#text} > QR_MAX_LENGTH)); then
+        printf '（链接长 %s 个字符，二维码过密无法在终端扫描；请复制链接，或使用统一订阅）\n' "${#text}"
+        return 1
+    fi
+    qrencode -t ANSIUTF8 -m 2 -- "$text"
+}
+
+show_links_command() {
+    local profiles="$XUI_INFO_DIR/3x-ui-node-profiles.json" argo="$XUI_INFO_DIR/3x-ui-argo.json" label link kind port
+    [[ -s "$profiles" ]] || {
+        fail "未找到本脚本的节点资料 ${profiles}。旧版单节点部署请查看 $XUI_INFO_DIR/3x-ui-xhttp-info.txt。"; return 1;
+    }
+    install_qrencode_optional
+    # 订阅地址与资料文件写入时相同：使用 TLS 节点证书覆盖的地址。
+    CERT_HOST=$(jq -r 'first(.[] | select(.security == "tls") | .clientOutbound.streamSettings.tlsSettings.serverName) // empty' "$profiles")
+    SERVER_IP=$(jq -r 'first(.[] | .clientOutbound.settings.address) // empty' "$profiles")
+    load_subscription_urls "$profiles"
+    print_subscription_block
+    if [[ "$SUB_STATUS" == ok ]]; then
+        printf '\n统一订阅二维码：\n'
+        print_qr "$SUB_URL" || true
+    fi
+    while IFS=$'\t' read -r label kind port link; do
+        printf '\n%b%s%b  %s/%s\n%s\n' "$CYAN" "$label" "$PLAIN" "$kind" "$port" "$link"
+        print_qr "$link" || true
+    done < <(
+        jq -r '.[] | [.label, (if .key == "hy2" then "UDP" else "TCP" end), (.port | tostring), .link] | @tsv' "$profiles"
+        if [[ -s "$argo" ]]; then jq -r '[.label, "TCP", "443", .link] | @tsv' "$argo"; fi
+    )
 }
 
 # 16. 统一订阅：使用 3x-ui 自带的订阅服务。3x-ui 要求每个客户端的订阅 ID 唯一，
@@ -2200,6 +2258,7 @@ print_usage() {
   --add-nodes                保留原入站，另加四种节点
   --switch-domain 域名       迁移现有节点证书与连接域名
   --enable-subscription      本脚本的节点共用一条订阅链接（含 Clash/Mihomo 格式）
+  --show-links               显示订阅、节点链接及二维码（只读）
   --update-xray              更新 Xray 内核到官方最新稳定版（启动失败自动恢复）
   --enable-xray-auto-update  开启每日自动检查并更新 Xray 内核
   --disable-xray-auto-update 关闭 Xray 自动更新
@@ -2293,9 +2352,10 @@ interactive_menu() {
             '  13) 开启 Xray 每日自动更新' \
             '  14) 关闭 Xray 自动更新' \
             '  15) 开启统一订阅（一条链接导入全部节点）' \
+            '  16) 查看订阅、节点链接与二维码' \
             '  0) 退出'
         choice=""
-        if ! menu_read_choice choice '请选择 [0-15]：'; then
+        if ! menu_read_choice choice '请选择 [0-16]：'; then
             printf '\n输入已结束，退出菜单。\n'
             return 0
         fi
@@ -2326,8 +2386,9 @@ interactive_menu() {
             13) menu_run_action --enable-xray-auto-update ;;
             14) menu_run_action --disable-xray-auto-update ;;
             15) menu_run_action --enable-subscription ;;
+            16) menu_run_action --show-links ;;
             '') ;;
-            *) log_warn "请输入 0–15。" ;;
+            *) log_warn "请输入 0–16。" ;;
         esac
     done
 }
@@ -2338,7 +2399,7 @@ main() {
         --help|-h) [[ $# -eq 1 ]] || { fail "帮助选项不能附带其他参数。"; return 1; }; print_usage; return 0 ;;
         --menu|--install|--add-nodes|--reinstall|--reinstall-status|--uninstall|--uninstall-status)
             [[ $# -eq 1 ]] || { fail "${action} 不接受额外参数。"; return 1; } ;;
-        --enable-xray-auto-update|--disable-xray-auto-update|--enable-subscription)
+        --enable-xray-auto-update|--disable-xray-auto-update|--enable-subscription|--show-links)
             [[ $# -eq 1 ]] || { fail "${action} 不接受额外参数。"; return 1; } ;;
         --switch-domain)
             [[ $# -le 2 ]] || { fail "--switch-domain 只接受一个域名。"; return 1; } ;;
@@ -2365,6 +2426,7 @@ main() {
         --switch-domain) acquire_maintenance_lock; switch_existing_to_domain "${2:-}" ;;
         --update-xray) acquire_maintenance_lock; update_xray_core "${2:-}" ;;
         --enable-subscription) acquire_maintenance_lock; enable_subscription_command ;;
+        --show-links) show_links_command ;;
         --enable-xray-auto-update) enable_xray_auto_update ;;
         --disable-xray-auto-update) disable_xray_auto_update ;;
         '')
