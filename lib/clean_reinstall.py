@@ -594,6 +594,27 @@ def read_latest(config, *, any_operation=False):
     return state
 
 
+def require_finished_socks_job():
+    """Read-only guard, called while holding the shared maintenance lock.
+
+    A killed SOCKS worker releases the OS lock but can leave live mutations.
+    Destructive maintenance must not erase its recovery evidence in that case.
+    """
+    root = safe_path(Path(DEFAULT_PATHS["info_dir"]) / "3xuish-socks-exit")
+    pointer = safe_path(root / "latest.json")
+    if not pointer.exists():
+        return
+    reference = json.loads(pointer.read_text(encoding="utf-8"))
+    name = reference.get("job") if isinstance(reference, dict) else None
+    if not isinstance(name, str) or not re.fullmatch(JOB_NAME, name):
+        raise ReinstallError("invalid_socks_job_pointer")
+    state_path = safe_path(root / name / "state.json")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    status = state.get("status") if isinstance(state, dict) else None
+    if not isinstance(status, str) or status not in {"complete", "failed", "rolled_back"}:
+        raise ReinstallError("previous_socks_job_needs_recovery")
+
+
 def launch_reinstall(config):
     import fcntl
     operation = operation_name(config)
@@ -612,6 +633,12 @@ def launch_reinstall(config):
             except BlockingIOError:
                 return {"status": "busy", "operation": operation,
                         "message": "已有重装、卸载或修复任务运行中；请等待完成后再重试。"}
+        try:
+            require_finished_socks_job()
+        except (ReinstallError, OSError, ValueError):
+            return {"status": "manual_recovery_required", "operation": operation,
+                    "error": "previous_socks_job_needs_recovery",
+                    "message": "上次 SOCKS5 创建尚未完成或恢复状态不可确认；请先运行 --socks-node-status。"}
         previous = read_latest(config, any_operation=True)
         if previous.get("status") in ACTIVE | {"manual_recovery_required"}:
             return {**previous, "status": "manual_recovery_required", "error": "previous_reinstall_needs_recovery"}

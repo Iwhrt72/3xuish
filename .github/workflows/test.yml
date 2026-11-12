@@ -15,10 +15,12 @@ jobs:
         run: |
           bash -n install.sh
           bash -n install_3xui_xhttp_vlessenc.sh
+          bash -n lib/socks_exit.sh
           shellcheck -S warning install.sh install_3xui_xhttp_vlessenc.sh
           bash -n scripts/server-speed-test.sh
           shellcheck -S warning scripts/server-speed-test.sh
           cmp install.sh install_3xui_xhttp_vlessenc.sh
+          python3 scripts/sync_socks_helpers.py --check
       - name: Test profiles and installation transactions
         run: python3 -m unittest discover -s tests -v
 
@@ -27,17 +29,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        check: [panel_smoke, existing_panel_smoke, performance_panel_smoke, runtime_smoke, server_speed_smoke, maintenance_panel_smoke, reality_target_smoke]
+        check: [panel_smoke, existing_panel_smoke, performance_panel_smoke, runtime_smoke, server_speed_smoke, maintenance_panel_smoke, reality_target_smoke, socks_exit_smoke]
+        scheme: [socks5]
+        include:
+          - check: socks_exit_smoke
+            scheme: http
+          - check: socks_exit_smoke
+            scheme: https
     steps:
       - uses: actions/checkout@v4
       - name: Validate against 3x-ui v3.11.0 and its bundled Xray
         run: |
           docker run --rm --entrypoint /bin/sh \
+            -e 'SMOKE_PROXY_SCHEME=${{ matrix.scheme }}' \
             --mount "type=bind,source=${{ github.workspace }},target=/repo,readonly" \
             ghcr.io/mhsanaei/3x-ui@sha256:1628adbd9bed680d25d6f714bef4a20f132105f4612ea294952f6665dad32e5b \
             -c 'apk add --no-cache bash jq sqlite openssl iproute2 curl python3 >/tmp/test-deps.log 2>&1 &&
                 cd /repo &&
-                if [ "$1" = runtime_smoke ] || [ "$1" = server_speed_smoke ] || [ "$1" = maintenance_panel_smoke ] || [ "$1" = reality_target_smoke ]; then
+                if [ "$1" = runtime_smoke ] || [ "$1" = server_speed_smoke ] || [ "$1" = maintenance_panel_smoke ] || [ "$1" = reality_target_smoke ] || [ "$1" = socks_exit_smoke ]; then
                   XRAY_BIN=/app/bin/xray-linux-amd64 python3 "tests/$1.py"
                 else
                   bash "tests/$1.sh"

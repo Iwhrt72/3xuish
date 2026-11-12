@@ -12,7 +12,7 @@ from test_installer import REPO, bash_directory, run_bash
 
 INBOUND_TAG = "managed-node-fixture"
 SOCKS_TAG = "managed-exit-fixture"
-DNS_TAG = "managed-dns-fixture"
+DNS_TAG = INBOUND_TAG + "-dns"
 PASSWORD = "fixture-password-must-not-be-logged"
 
 
@@ -34,8 +34,9 @@ def exit_plan() -> dict:
             {
                 "tag": DNS_TAG,
                 "protocol": "dns",
-                "settings": {"network": "tcp", "address": "1.1.1.1", "port": 53},
-                "proxySettings": {"tag": SOCKS_TAG},
+                "settings": {"rewriteNetwork": "tcp", "rewriteAddress": "1.1.1.1",
+                             "rewritePort": 53, "rules": [{"action": "direct"}]},
+                "streamSettings": {"sockopt": {"dialerProxy": SOCKS_TAG}},
             },
         ],
     }
@@ -129,7 +130,7 @@ merge_socks_exit_config "$SOCKS_TEST_ROOT/template.json" "$SOCKS_TEST_ROOT/plan.
         self.assertFalse(isinstance(document, dict) and "outbounds" in document,
                          "A failed merge emitted a replacement config")
 
-    def test_preserves_existing_configuration_and_inserts_before_network_fallback(self):
+    def test_preserves_existing_configuration_and_global_denies_without_exit_bypass(self):
         existing_rules = [
             {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
             {"type": "field", "ip": ["geoip:private"], "outboundTag": "blocked"},
@@ -148,9 +149,15 @@ merge_socks_exit_config "$SOCKS_TEST_ROOT/template.json" "$SOCKS_TEST_ROOT/plan.
         self.assertEqual({k: v for k, v in merged["routing"].items() if k != "rules"},
                          {k: v for k, v in config["routing"].items() if k != "rules"})
         rules = merged["routing"]["rules"]
-        self.assertEqual(rules[:5], existing_rules[:5])
-        self.assert_routes(rules[5:7])
-        self.assertEqual(rules[7:], existing_rules[5:])
+        self.assertEqual(rules[0], existing_rules[0])
+        self.assertEqual(rules[1], {**existing_rules[1], "inboundTag": [INBOUND_TAG],
+                                   "ruleTag": INBOUND_TAG + "-deny-1"})
+        self.assertEqual(rules[2], {**existing_rules[2], "inboundTag": [INBOUND_TAG],
+                                   "ruleTag": INBOUND_TAG + "-deny-2"})
+        self.assert_routes(rules[3:5])
+        self.assertEqual(rules[5:], existing_rules[1:])
+        # Removing only new-node rules leaves the exact original policy.
+        self.assertEqual([r for r in rules if r.get("inboundTag") != [INBOUND_TAG]], existing_rules)
 
     def test_fallback_detection_handles_network_order_and_unconditional_rule(self):
         for fallback in (
@@ -180,14 +187,42 @@ merge_socks_exit_config "$SOCKS_TEST_ROOT/template.json" "$SOCKS_TEST_ROOT/plan.
                           "outboundTag": "blocked", **condition}
                 config = template([scoped])
                 rules = self.merged(config)["routing"]["rules"]
-                self.assertEqual(rules[0], scoped)
-                self.assert_routes(rules[1:])
+                if "inboundTag" in condition:
+                    self.assert_routes(rules[:2])
+                    self.assertEqual(rules[2:], [scoped])
+                else:
+                    self.assertEqual(rules[0], {**scoped, "inboundTag": [INBOUND_TAG],
+                                               "ruleTag": INBOUND_TAG + "-deny-0"})
+                    self.assert_routes(rules[1:3])
+                    self.assertEqual(rules[3:], [scoped])
 
-    def test_without_fallback_appends_after_existing_rules(self):
-        existing = [{"type": "field", "network": "tcp", "outboundTag": "direct"}]
-        rules = self.merged(template(existing))["routing"]["rules"]
-        self.assertEqual(rules[0], existing[0])
-        self.assert_routes(rules[1:])
+    def test_global_dns_tcp_domain_and_balancer_rules_cannot_bypass_dedicated_exit(self):
+        for old_rule in (
+            {"type": "field", "network": "tcp", "outboundTag": "direct"},
+            {"type": "field", "network": "udp", "port": "53", "outboundTag": "direct"},
+            {"type": "field", "domain": ["domain:example.com"], "outboundTag": "unrelated-exit"},
+            {"type": "field", "network": "tcp,udp", "balancerTag": "existing-pool"},
+        ):
+            with self.subTest(rule=old_rule):
+                rules = self.merged(template([old_rule]))["routing"]["rules"]
+                self.assert_routes(rules[:2])
+                self.assertEqual(rules[2:], [old_rule])
+
+    def test_routing_script_is_rejected_before_any_output(self):
+        config = template()
+        config["routing"]["script"] = "custom.lua"
+        self.assert_rejected(config)
+
+    def test_actual_plan_builder_routes_dns_over_tcp_through_the_selected_socks(self):
+        with tempfile.TemporaryDirectory(prefix="socks-plan-", dir=REPO) as temp:
+            root = Path(temp)
+            (root / "upstream.json").write_text(json.dumps(exit_plan()["outbounds"][0]), encoding="utf-8")
+            result = run_bash(r'''
+source ./lib/socks_exit.sh
+build_socks_exit_plan "$SOCKS_TEST_ROOT/upstream.json" managed-node-fixture
+''', extra_env={"SOCKS_TEST_ROOT": bash_directory(root)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), exit_plan())
 
     def test_empty_rule_list_gets_both_node_scoped_routes(self):
         self.assert_routes(self.merged(template())["routing"]["rules"])
