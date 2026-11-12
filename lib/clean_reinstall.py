@@ -615,6 +615,22 @@ def require_finished_socks_job():
         raise ReinstallError("previous_socks_job_needs_recovery")
 
 
+def require_finished_panel_job():
+    """Do not reset a panel whose upgrade recovery is unresolved."""
+    root = safe_path(Path(DEFAULT_PATHS["info_dir"]) / "3xuish-panel-update")
+    pointer = safe_path(root / "latest.json")
+    if not pointer.exists():
+        return
+    reference = json.loads(pointer.read_text(encoding="utf-8"))
+    name = reference.get("job") if isinstance(reference, dict) else None
+    if not isinstance(name, str) or not re.fullmatch(JOB_NAME, name):
+        raise ReinstallError("invalid_panel_upgrade_pointer")
+    state = json.loads(safe_path(root / name / "state.json").read_text(encoding="utf-8"))
+    status = state.get("status") if isinstance(state, dict) else None
+    if not isinstance(status, str) or status not in {"complete", "no_update", "failed", "rolled_back"}:
+        raise ReinstallError("previous_panel_upgrade_needs_recovery")
+
+
 def launch_reinstall(config):
     import fcntl
     operation = operation_name(config)
@@ -639,6 +655,12 @@ def launch_reinstall(config):
             return {"status": "manual_recovery_required", "operation": operation,
                     "error": "previous_socks_job_needs_recovery",
                     "message": "上次 SOCKS5 创建尚未完成或恢复状态不可确认；请先运行 --socks-node-status。"}
+        try:
+            require_finished_panel_job()
+        except (ReinstallError, OSError, ValueError):
+            return {"status": "manual_recovery_required", "operation": operation,
+                    "error": "previous_panel_upgrade_needs_recovery",
+                    "message": "上次面板升级尚未完成或恢复状态不可确认；请先运行 --panel-update-status。"}
         previous = read_latest(config, any_operation=True)
         if previous.get("status") in ACTIVE | {"manual_recovery_required"}:
             return {**previous, "status": "manual_recovery_required", "error": "previous_reinstall_needs_recovery"}
