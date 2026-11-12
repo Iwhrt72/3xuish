@@ -29,8 +29,17 @@ bash /tmp/3xuish-install.sh
 9) 查看清空重装结果
 10) 卸载面板与节点（保留私有备份和证书）
 11) 查看卸载结果
-12) 添加代理出口节点（SOCKS5 / HTTP / HTTPS）
-13) 查看代理节点创建结果
+12) 一键更新 Xray 内核
+13) 开启 Xray 每日自动更新
+14) 关闭 Xray 自动更新
+15) 开启统一订阅（一条链接导入全部节点）
+16) 查看订阅、节点链接与二维码
+17) Hy2 端口跳跃（开启、修改或关闭）
+18) Argo 隧道（Cloudflare，IP 被封时备用）
+19) 切换 Xray 内核到指定版本
+20) 回滚到上一次更新前的 Xray 内核
+21) 添加代理出口节点（SOCKS5 / HTTP / HTTPS）
+22) 查看代理节点创建结果
 0) 退出
 ```
 
@@ -40,7 +49,7 @@ bash /tmp/3xuish-install.sh
 
 ## 添加代理出口节点
 
-在已有 3x-ui 的 VPS 上，进入菜单选 `12`，或执行 `sudo bash install.sh --add-proxy-node`。支持 SOCKS5、HTTP CONNECT、HTTPS CONNECT，地址可以是 IPv4、IPv6 或域名；支持账号密码和 IP 白名单免认证（账号、密码同时留空）。旧命令 `--add-socks-node` 继续有效。脚本使用已有面板认证和 TLS 证书，自动选择空闲 TCP 端口，创建 VLESS TCP + TLS + Vision 入站；成功后用输出的入站名称在面板导出节点。
+在已有 3x-ui 的 VPS 上，进入菜单选 `21`，或执行 `sudo bash install.sh --add-proxy-node`。支持 SOCKS5、HTTP CONNECT、HTTPS CONNECT，地址可以是 IPv4、IPv6 或域名；支持账号密码和 IP 白名单免认证（账号、密码同时留空）。旧命令 `--add-socks-node` 继续有效。脚本使用已有面板认证和 TLS 证书，自动选择空闲 TCP 端口，创建 VLESS TCP + TLS + Vision 入站；成功后用输出的入站名称在面板导出节点。
 
 输入方式可以选择分项填写或整行粘贴。密码以及包含凭据的整行资料均不回显。以下平台导出格式均可使用：
 
@@ -63,7 +72,7 @@ URI 中凭据的 `@`、`%`、空格等特殊字符应使用百分号编码，例
 
 输入完成后，脚本将创建任务交给独立的后台进程，SSH 断开后任务仍会继续。任务先备份面板数据库，再创建禁用的入站，保存并回读对应规则后启用，最后通过本地 Xray 客户端实测 DNS 和 HTTPS。脚本不再因磁盘启动配置未刷新而强制重启 Xray；面板自身在配置无法热应用时仍可能需要重启核心。遇到失败会尝试删除本次入站并清理专属规则，回读确认后记录回滚结果。
 
-前台最多等待 60 秒。任务仍在运行或连接中断时，用菜单 `13` 或以下命令查询：
+前台最多等待 60 秒。任务仍在运行或连接中断时，用菜单 `22` 或以下命令查询：
 
 ```bash
 sudo bash install.sh --proxy-node-status
@@ -108,7 +117,15 @@ bash /tmp/3xuish-install.sh --menu
 bash /tmp/3xuish-install.sh --install
 bash /tmp/3xuish-install.sh --speed-test --seconds 5
 bash /tmp/3xuish-install.sh --speed-test --inbound-id 1 --inbound-id 4
+bash /tmp/3xuish-install.sh --enable-subscription
+bash /tmp/3xuish-install.sh --show-links
+bash /tmp/3xuish-install.sh --hy2-hop 20000-50000
+bash /tmp/3xuish-install.sh --argo quick
+bash /tmp/3xuish-install.sh --switch-xray 26.10.21
+bash /tmp/3xuish-install.sh --rollback-xray
 ```
+
+`bash /tmp/3xuish-install.sh --help` 列出全部选项。
 
 ## 已有服务器清空重装
 
@@ -150,7 +167,127 @@ SSH 断开后在菜单选择 `11`，或查询：
 bash /tmp/3xuish-install.sh --uninstall-status
 ```
 
-以 `complete` 为卸载完成依据。安装、重装、卸载、参数修复、添加节点和域名迁移共用维护锁；已有维护任务未完成时，其他修改操作会停止，避免同时移动或写入部署数据。操作期间也请勿直接在面板修改配置。
+以 `complete` 为卸载完成依据。安装、重装、卸载、参数修复、添加节点、域名迁移、Xray 内核更新/切换/回滚、统一订阅、端口跳跃和 Argo 隧道共用维护锁；已有维护任务未完成时，其他修改操作会停止，避免同时移动或写入部署数据。操作期间也请勿直接在面板修改配置。
+
+## 更新 Xray 内核
+
+在管理菜单选择 `12`，或执行：
+
+```bash
+bash /tmp/3xuish-install.sh --update-xray
+```
+
+脚本从 [XTLS/Xray-core](https://github.com/XTLS/Xray-core/releases) 获取最新稳定版，不使用预发布版。当前已是最新时不修改文件，也不重启。需要更新时按以下顺序执行，任一步失败都不替换内核：
+
+1. 下载与面板内核架构对应的官方发布包，核对同一发布中 `.dgst` 文件的 SHA2-256。
+2. 用新内核对当前 `bin/config.json` 执行 `run -test`，确认新版本接受现有节点配置。
+3. 把原内核备份到 `/root/3xuish-xray-backup/`，替换后重启 `x-ui`，节点会短暂断开。
+4. 最多等待约 60 秒，确认新内核进程在运行，且原有入站端口全部恢复监听；否则自动换回原内核并重启。
+
+此功能只更新 Xray，不更新 3x-ui 面板、geo 文件或操作系统内核。以后升级 3x-ui 面板时，面板会装回自带的 Xray 版本，可再次运行本命令或开启自动更新。通过本机节点代理连接 SSH 时，重启会中断管理连接，建议使用直连 SSH。
+
+### 指定版本与回滚
+
+菜单 `19` 切换到指定版本，`20` 回滚，或执行：
+
+```bash
+bash /tmp/3xuish-install.sh --switch-xray 26.10.21
+bash /tmp/3xuish-install.sh --rollback-xray
+```
+
+`--switch-xray` 可以安装任意官方发布版本，包括降级和预发布版（会提示不稳定）；官方没有的版本号会直接拒绝。`--rollback-xray` 换回上一次更新、切换或回滚之前的内核，当前内核同时成为新的备份，所以再执行一次就能换回来。两者都走上面的同一套校验、替换、启动检查和自动恢复流程。
+
+开启了每日自动更新时，指定的旧版本会在下次检查时被升级到最新稳定版，脚本会提示；要停留在某个版本，请先关闭自动更新。
+
+### 每日自动更新
+
+菜单 `13` 开启，`14` 关闭，或执行：
+
+```bash
+bash /tmp/3xuish-install.sh --enable-xray-auto-update
+bash /tmp/3xuish-install.sh --disable-xray-auto-update
+```
+
+开启后，脚本会复制到 `/usr/local/lib/3xuish/install.sh`（Argo 临时隧道也使用这份副本），并在 root 的 crontab 写入一条任务：每天 03:00–05:59 之间的随机时刻（服务器时区）执行与上面相同的检查、校验和回滚，日志写入 `/var/log/3xuish-xray-update.log`。定时任务只运行这份本地副本，不会每天下载远程脚本；要更新副本，用新版脚本重新开启一次即可。发现新版本时会重启一次 `x-ui`。系统需要已安装并运行 cron（安装四节点时已自动安装）。
+
+关闭只删除这条定时任务；本地副本在 Argo 临时隧道也不再使用时才删除。当前内核、日志和旧内核备份保持不变。
+
+CVE-2026-98432 是 Linux 内核 IPv4 TCP 处理中的漏洞。Xray v26.10.31 默认关闭 MPTCP，可以减小攻击面，但不能修复内核本身；根本修复需要通过系统包管理器安装发行版修复后的内核并重启。更新完成后，若系统仍为 `net.mptcp.enabled=1`，脚本会提示当前运行的内核版本。
+
+## 统一订阅
+
+新装会直接开启；已有部署在菜单选择 `15`，或执行：
+
+```bash
+bash /tmp/3xuish-install.sh --enable-subscription
+```
+
+订阅使用 3x-ui 自带的订阅服务，安装结尾和 `/root/3x-ui-nodes-info.txt` 会给出两条地址：
+
+- 通用订阅：v2rayN、v2rayNG、Shadowrocket 等导入后得到全部节点。
+- Clash / Mihomo 订阅：Mihomo 内核的客户端使用。
+
+3x-ui 要求每个客户端的订阅 ID 唯一，因此由主用节点的客户端承载统一订阅，其他节点的分享链接作为它的“外部链接”（面板中该客户端的“链接”页）。各节点仍保留独立的 UUID 和认证凭据，订阅里的链接与资料文件中的一致。请勿在面板中删除这些外部链接；域名切换、端口跳跃和 Argo 隧道的变化会由脚本自动同步。
+
+- **新装**：订阅端口 TCP `2096`（可用 `XUI_SUB_PORT` 指定），使用节点证书提供 HTTPS，并开启 Clash/Mihomo 格式。订阅路径由 3x-ui 随机生成。
+- **已有部署**：只改承载客户端的订阅 ID（旧 ID 由节点标签派生，改为随机值），其他客户端、流量额度和到期时间不变。订阅服务已开启时保留原端口；原来是 HTTP 时会询问是否改为 HTTPS（已分发的 HTTP 订阅地址会失效）。重复执行不会再修改。
+
+需要在安全组放行订阅端口。部分客户端不支持某些协议的 Clash 写法时，脚本会提示这些节点改用通用订阅。
+
+## 节点二维码
+
+安装结尾显示统一订阅的二维码。查看全部节点的链接和二维码，在菜单选择 `16`，或执行：
+
+```bash
+bash /tmp/3xuish-install.sh --show-links
+```
+
+此操作只读。缺少 `qrencode` 时会尝试安装（RHEL 系列可能需要 EPEL，装不上时只显示链接）。超过约 550 个字符的链接（例如 ML-KEM-768 认证的 XHTTP 链接）在终端里过密无法扫描，会提示改用复制链接或统一订阅。
+
+## Hy2 端口跳跃
+
+运营商对单个 UDP 端口限速时，可以让客户端在一段端口范围内轮换连接。在菜单选择 `17`，或执行：
+
+```bash
+bash /tmp/3xuish-install.sh --hy2-hop 20000-50000   # 开启或修改范围
+bash /tmp/3xuish-install.sh --hy2-hop status
+bash /tmp/3xuish-install.sh --hy2-hop off
+```
+
+脚本用 nftables（没有时用 iptables）把这段 UDP 端口重定向到 Hy2 端口，系统支持时同时添加 IPv6 规则，并安装 `3xuish-hy2-hop` 开机服务（systemd 或 OpenRC）恢复规则。Xray 仍只监听原 Hy2 端口；范围同时写入入站的 UDP Hop 设置，分享链接带 `mport`，订阅和 Clash 格式也会带上端口范围。
+
+- 范围内已有其他程序或面板入站使用的 UDP 端口时会拒绝，避免把它们的流量导向 Hy2。
+- 需要在云安全组和系统防火墙放行整段 UDP 范围；旧客户端需重新导入 Hy2 链接或刷新订阅。
+- 客户端需支持端口跳跃（如 v2rayN、Mihomo）；不支持的客户端仍连接原端口。
+- 重新加载 nftables 或 firewalld 可能清掉规则，`--hy2-hop status` 会提示，重新运行开启命令即可恢复。
+
+## Argo 隧道
+
+服务器 IP 被封时，可以经 Cloudflare 的隧道连接。在菜单选择 `18`，或执行：
+
+```bash
+bash /tmp/3xuish-install.sh --argo quick    # 临时隧道，免账号
+bash /tmp/3xuish-install.sh --argo fixed    # 固定隧道，需要 Cloudflare 账号和托管域名
+bash /tmp/3xuish-install.sh --argo status
+bash /tmp/3xuish-install.sh --argo off
+```
+
+脚本下载 Cloudflare 官方 cloudflared（核对发布说明中的 SHA-256），新增一个只监听 `127.0.0.1` 的 VLESS 入站，安装 `3xuish-argo` 开机服务，并把 Argo 节点加入统一订阅。
+
+- 入站使用 WebSocket + VLESS Encryption + Vision：Cloudflare 终止外层 TLS，VLESS Encryption 让它看不到代理内容。实测 XHTTP 无论哪种模式都无法穿过 cloudflared 的本机转发，因此 Argo 节点使用 WebSocket；Xray 会提示 WebSocket 不再推荐，可忽略。
+- **临时隧道**使用 `trycloudflare.com` 域名，仅供测试，无可用性保证，服务每次重启域名都会变。服务启动后会自动把新域名写回面板、资料文件和统一订阅；单独导入的链接需要重新导入。
+- **固定隧道**需要先在 Cloudflare Zero Trust → 网络 → 隧道 创建隧道并复制令牌（也可用 `ARGO_TOKEN`、`ARGO_DOMAIN` 传入）。脚本会提示在“公共主机名”中把域名指向 `HTTP 127.0.0.1:端口`。令牌只保存在 `/etc/3xuish/argo.env`（权限 600），不出现在进程命令行。
+- 关闭会删除 Argo 入站、服务、cloudflared 和相关文件，并从统一订阅中移除。
+
+清空重装和卸载不会处理端口跳跃、Argo 隧道和自动更新；执行前脚本会列出仍在运行的这几项，建议先关闭。
+
+## IPv6 服务器
+
+- **纯 IPv6 服务器**：检测不到公网 IPv4 时自动使用 IPv6 地址部署，IP 证书和域名证书都会让 acme.sh 监听 IPv6（`--listen-v6`）。
+- **双栈服务器**：默认仍用 IPv4；要用 IPv6 部署，设置 `XUI_SERVER_IP` 为 IPv6 地址，例如 `XUI_SERVER_IP=2001:db8::10`。
+- 分享链接、面板地址和订阅地址中的 IPv6 地址会加方括号。
+
+GitHub 不支持 IPv6，而安装 3x-ui、更新 Xray 和下载 cloudflared 都需要访问 GitHub。纯 IPv6 服务器请先配置 NAT64/DNS64，或安装 WARP 获得 IPv4 出口；新装时访问不到 GitHub 会在申请证书前停止并给出提示。
 
 ## 放行需要的端口
 
@@ -164,8 +301,10 @@ bash /tmp/3xuish-install.sh --uninstall-status
 | `443` | TCP | RAW TCP + TLS |
 | `24443` | TCP | VLESS + REALITY |
 | `8443` | TCP | XHTTP |
+| `2096` | TCP | 统一订阅（`XUI_SUB_PORT` 可改） |
+| 跳跃范围 | UDP | Hy2 端口跳跃，仅在开启后需要 |
 
-如果在向导或环境变量中改过端口，以安装结尾输出为准。Hy2 需要放行的是 **UDP**；只开放同数字的 TCP 端口不够。
+如果在向导或环境变量中改过端口，以安装结尾输出为准。Hy2 需要放行的是 **UDP**；只开放同数字的 TCP 端口不够。Argo 隧道由服务器主动连接 Cloudflare，不需要放行入站端口。
 
 ## 选择证书
 

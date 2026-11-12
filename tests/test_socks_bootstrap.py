@@ -121,7 +121,7 @@ socks_node_status_command() { printf 'SOCKS_STATUS_SELECTED\n'; }
             directory = Path(temp)
             path = script_fixture(directory, overrides)
             for args, text in ((("--socks-node-status",), ""), (("--proxy-node-status",), ""),
-                               (("--menu",), "13\n0\n")):
+                               (("--menu",), "22\n0\n")):
                 with self.subTest(args=args):
                     result = execute_fixture(directory, path, args, text)
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -137,12 +137,28 @@ socks_exit_command() { printf 'PROXY_CREATE_SELECTED\n'; }
             directory = Path(temp)
             path = script_fixture(directory, overrides)
             for args, text in ((("--add-proxy-node",), ""), (("--add-socks-node",), ""),
-                               (("--menu",), "12\n0\n")):
+                               (("--menu",), "21\n0\n")):
                 with self.subTest(args=args):
                     result = execute_fixture(directory, path, args, text)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn("PROXY_CREATE_SELECTED", result.stdout)
                     self.assertIn("LOCKED", result.stdout)
+
+    def test_existing_core_menu_actions_keep_their_numbers(self):
+        overrides = r'''
+menu_xray_status() { :; }
+update_xray_core() { printf 'CORE_UPDATE_SELECTED\n'; }
+enable_xray_auto_update() { printf 'AUTO_UPDATE_SELECTED\n'; }
+socks_exit_command() { printf 'UNEXPECTED_PROXY_CREATE\n'; return 95; }
+'''
+        with tempfile.TemporaryDirectory(prefix="core-proxy-menu-", dir=REPO) as temp:
+            directory = Path(temp)
+            result = execute_fixture(directory, script_fixture(directory, overrides),
+                                     ("--menu",), "12\n13\n0\n")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("CORE_UPDATE_SELECTED", result.stdout)
+            self.assertIn("AUTO_UPDATE_SELECTED", result.stdout)
+            self.assertNotIn("UNEXPECTED_PROXY_CREATE", result.stdout)
 
     def test_shared_mutation_guard_rejects_unresolved_socks_jobs(self):
         with tempfile.TemporaryDirectory(prefix="socks-guard-", dir=REPO) as temp:

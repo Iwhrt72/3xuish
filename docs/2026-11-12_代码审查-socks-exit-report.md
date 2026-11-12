@@ -89,7 +89,7 @@ exit-node/current.json: No such file or directory
 | 问题 | 实现 | 对应回归 |
 | --- | --- | --- |
 | F1 | `proxy_exit_running` 使用面板启用状态和监听，随后执行真实协议探测；移除启动文件过期触发的全局强制重启 | `tests/test_socks_runtime.py`；真实面板 smoke 检查核心 PID 与已有 TCP 会话 |
-| F2 | 新增 `lib/socks_exit_job.py` 独立会话任务；快照源码与输入、继承维护锁、持久状态、菜单13与 `--socks-node-status` | `tests/test_socks_exit_job.py` 的 HUP、删除来源、锁、PTY 前台、状态与原函数补偿测试 |
+| F2 | 新增 `lib/socks_exit_job.py` 独立会话任务；快照源码与输入、继承维护锁、持久状态、菜单22与 `--socks-node-status` | `tests/test_socks_exit_job.py` 的 HUP、删除来源、锁、PTY 前台、状态与原函数补偿测试 |
 | F3 | 保留面板核心 API 专用规则在首位；为新入站复制适用的全局 blackhole 阻断，再添加其 DNS/SOCKS 专属规则，随后保留旧业务规则原顺序；拒绝非空 routing.script | `tests/test_socks_exit_provision.py` 的真实计划生成与优先级回归；smoke 观察实际 TCP DNS CONNECT |
 | F4 | 单文件入口内嵌全部 SOCKS 组件并逐个校验；生成器同步两入口与哈希；CI 检查过期 bundle | `tests/test_socks_bootstrap.py` 的离线解包、篡改、过期与入口分发测试 |
 | F5 | 预检出口 IP 仅作观察值；默认支持轮换，`SOCKS_EXIT_EXPECTED_IP` 显式启用固定 IP 验收；返回实际节点出口 | `tests/test_socks_node_probe.py` 与 smoke 的两次不同出口 |
@@ -160,7 +160,7 @@ old rules and deny policy preserved
 
 ## 同日后续：主菜单与多协议输入扩展
 
-菜单12现为“添加代理出口节点（SOCKS5 / HTTP / HTTPS）”，菜单13为“查看代理节点创建结果”。新增 `--add-proxy-node`、`--proxy-node-status`，原 SOCKS 命令和任务目录继续兼容。两份安装入口仍字节一致，新增输入解析器 `lib/proxy_input.py` 也包含在单文件发布中。
+发布前同步主分支的新功能后，代理选项顺延为21/22，保留主分支原12–20项编号。菜单21为“添加代理出口节点（SOCKS5 / HTTP / HTTPS）”，菜单22为“查看代理节点创建结果”。新增 `--add-proxy-node`、`--proxy-node-status`，原 SOCKS 命令和任务目录继续兼容。两份安装入口仍字节一致，新增输入解析器 `lib/proxy_input.py` 也包含在单文件发布中。
 
 已支持用户截图中的四种格式：`hostname:port:username:password`、`socks5://username:password@hostname:port`、`username:password@hostname:port`、`hostname:port@username:password`。同时支持 HTTP/HTTPS URI、IP/域名/IDNA/IPv6、免认证以及分项输入。协议与排列格式分别处理；无前缀时选择协议，多个有效字段解释时拒绝自动猜测。URI 凭据按 UTF-8 解码一次，裸格式和分项凭据保留原文，错误不回显秘密资料。
 
