@@ -231,13 +231,13 @@ PY
     jq --arg tag "$exit_tag" '.inboundTag = $tag' "$work/plan.json" >"$work/actual-plan.json" &&
         mv -- "$work/actual-plan.json" "$work/plan.json" || return 1
     proxy_exit_get_template >"$work/current.json" || return 1
-    jq -cS --arg tag "$exit_tag" '
-        .xraySetting.inbounds = ((.xraySetting.inbounds // []) |
-            map(select((.tag // "") != $tag)) | sort_by(.tag // ""))
+    jq -cS '
+        {xraySetting: (.xraySetting | del(.inbounds)),
+         outboundTestUrl: (.outboundTestUrl // "")}
     ' "$work/original.json" >"$work/original-normalized.json" || return 1
-    jq -cS --arg tag "$exit_tag" '
-        .xraySetting.inbounds = ((.xraySetting.inbounds // []) |
-            map(select((.tag // "") != $tag)) | sort_by(.tag // ""))
+    jq -cS '
+        {xraySetting: (.xraySetting | del(.inbounds)),
+         outboundTestUrl: (.outboundTestUrl // "")}
     ' "$work/current.json" >"$work/current-normalized.json" || return 1
     if [[ "$(<"$work/original-normalized.json")" != "$(<"$work/current-normalized.json")" ]]; then
         fail "面板模板在创建期间被其他操作修改，请重试。"; return 1
