@@ -1513,7 +1513,7 @@ reinstall_command() { maintenance_command reinstall "$@"; }
 uninstall_command() { maintenance_command uninstall "$@"; }
 
 socks_exit_command() {
-    local source_dir name expected actual helper
+    local source_dir name expected actual helper ref downloaded
     command -v sha256sum >/dev/null 2>&1 || { fail "未找到 sha256sum。"; return 1; }
     source_dir="$(cd -- "$(dirname -- "$INSTALLER_SOURCE_FILE")" && pwd)"
     for name in socks_exit.sh socks_node_probe.py; do
@@ -1521,10 +1521,24 @@ socks_exit_command() {
         if [[ -f "$source_dir/lib/$name" ]]; then
             cp -- "$source_dir/lib/$name" "$helper" || return 1
         else
-            curl -q -fLsS --connect-timeout 10 --max-time 60 \
-                "${REPO_RAW_URL%/*}/lib/$name" -o "$helper" || {
+            downloaded=0
+            for ref in main codex/reality-target-compatibility; do
+                if curl -q -fLsS --connect-timeout 10 --max-time 60 \
+                    "https://raw.githubusercontent.com/Iwhrt72/3xuish/$ref/lib/$name" -o "$helper"; then
+                    actual=$(sha256sum "$helper") || return 1
+                    case "$name" in
+                        socks_exit.sh) expected="$SOCKS_EXIT_SHA256" ;;
+                        socks_node_probe.py) expected="$SOCKS_EXIT_PROBE_SHA256" ;;
+                    esac
+                    if [[ "${actual%% *}" == "$expected" ]]; then
+                        downloaded=1
+                        break
+                    fi
+                fi
+            done
+            if [[ "$downloaded" != 1 ]]; then
                 fail "出口组件下载失败；请使用同一版本的完整仓库。"; return 1;
-            }
+            fi
         fi
         actual=$(sha256sum "$helper") || return 1
         case "$name" in
