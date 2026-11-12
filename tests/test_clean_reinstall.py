@@ -544,6 +544,71 @@ class CleanReinstall(unittest.TestCase):
         self.assertEqual(reset["operation"], "reinstall", reset)
         self.assertEqual(uninstall["operation"], "uninstall", uninstall)
 
+    def test_missing_socks_history_guard_does_not_create_files(self):
+        root = Path(self.paths["info_dir"]) / "3xuish-socks-exit"
+        reinstall.require_finished_socks_job()
+        self.assertFalse(root.exists())
+
+    def test_completed_socks_history_allows_maintenance_guard(self):
+        root = Path(self.paths["info_dir"]) / "3xuish-socks-exit"
+        job = root / "job-20261112T010101Z-0123456789ab"
+        job.mkdir(parents=True)
+        reinstall.atomic_json(root / "latest.json", {"job": job.name})
+        for status in ("complete", "failed", "rolled_back"):
+            with self.subTest(status=status):
+                reinstall.atomic_json(job / "state.json", {"status": status})
+                before = (job / "state.json").read_bytes()
+                reinstall.require_finished_socks_job()
+                self.assertEqual((job / "state.json").read_bytes(), before)
+
+    @unittest.skipUnless(os.name == "posix", "shared maintenance lock requires POSIX flock")
+    def test_unresolved_or_malformed_socks_history_blocks_reset_before_mutation(self):
+        import fcntl
+        root = Path(self.paths["info_dir"]) / "3xuish-socks-exit"
+        job = root / "job-20261112T010101Z-0123456789ab"
+        job.mkdir(parents=True)
+        states = [json.dumps({"status": value}) for value in
+                  ("starting", "running", "manual_recovery_required", "unknown")]
+        states.extend(("{broken", "[]", "{}", '{"status": []}', '{"status": {}}'))
+        original_guard = reinstall.require_finished_socks_job
+
+        def guard_with_lock_check():
+            descriptor = os.open(self.job.parent / "reinstall.lock", os.O_RDWR)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(descriptor)
+            original_guard()
+
+        for operation in ("reinstall", "uninstall"):
+            for state in states:
+                with self.subTest(operation=operation, state=state):
+                    reinstall.atomic_json(root / "latest.json", {"job": job.name})
+                    (job / "state.json").write_text(state, encoding="utf-8")
+                    with mock.patch.object(reinstall.subprocess, "Popen") as launch, \
+                         mock.patch.object(reinstall, "preflight_layout") as preflight, \
+                         mock.patch.object(reinstall, "require_finished_socks_job",
+                                           side_effect=guard_with_lock_check):
+                        result = reinstall.launch_reinstall(dict(self.config, operation=operation))
+                    self.assertEqual(result["status"], "manual_recovery_required", result)
+                    self.assertEqual(result["error"], "previous_socks_job_needs_recovery")
+                    launch.assert_not_called()
+                    preflight.assert_not_called()
+                    self.assertEqual(self.snapshot_managed(), self.before)
+                    self.assertEqual(self.read_rows(), self.before_rows)
+                    self.assertEqual((job / "state.json").read_text(), state)
+
+        for pointer in ("../outside", None, "job-invalid"):
+            with self.subTest(pointer=pointer):
+                reinstall.atomic_json(root / "latest.json", {"job": pointer})
+                with mock.patch.object(reinstall.subprocess, "Popen") as launch:
+                    result = reinstall.launch_reinstall(self.config)
+                self.assertEqual(result["status"], "manual_recovery_required", result)
+                launch.assert_not_called()
+        self.assertEqual(self.snapshot_managed(), self.before)
+        self.assertEqual(self.read_rows(), self.before_rows)
+
     @unittest.skipUnless(os.name == "posix", "detached maintenance requires POSIX sessions and locks")
     def test_actual_detached_uninstall_survives_source_removal_and_holds_both_locks(self):
         source = Path(reinstall.__file__).read_text(encoding="utf-8")

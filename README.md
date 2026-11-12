@@ -38,12 +38,62 @@ bash /tmp/3xuish-install.sh
 18) Argo 隧道（Cloudflare，IP 被封时备用）
 19) 切换 Xray 内核到指定版本
 20) 回滚到上一次更新前的 Xray 内核
+21) 添加代理出口节点（SOCKS5 / HTTP / HTTPS）
+22) 查看代理节点创建结果
 0) 退出
 ```
 
 已有面板时可以直接选择 `2` 测速，结束后返回菜单。测速不修改配置或重启面板，会消耗测试流量；完整行为和用量见下方“服务器测速”。选择 `1` 新装时会先检查已有数据库；已有面板要清空后重新部署，请选择 `8`。添加四节点、原位修复和清空重装是独立选项。
 
 请先下载到文件再执行，以便菜单为每个操作启动独立进程；不要使用 `curl ... | bash` 打开菜单。关闭终端前输入 `0` 退出即可。
+
+## 添加代理出口节点
+
+在已有 3x-ui 的 VPS 上，进入菜单选 `21`，或执行 `sudo bash install.sh --add-proxy-node`。支持 SOCKS5、HTTP CONNECT、HTTPS CONNECT，地址可以是 IPv4、IPv6 或域名；支持账号密码和 IP 白名单免认证（账号、密码同时留空）。旧命令 `--add-socks-node` 继续有效。脚本使用已有面板认证和 TLS 证书，自动选择空闲 TCP 端口，创建 VLESS TCP + TLS + Vision 入站；成功后用输出的入站名称在面板导出节点。
+
+输入方式可以选择分项填写或整行粘贴。密码以及包含凭据的整行资料均不回显。以下平台导出格式均可使用：
+
+| 格式 | 示例 | 协议选择 |
+| --- | --- | --- |
+| `hostname:port:username:password` | `proxy.example:1080:user:pass` | 按平台说明选择 |
+| `协议://username:password@hostname:port` | `socks5://user:pass@proxy.example:1080` | 使用 URI 前缀，支持 `socks5`、`socks5h`、`http`、`https` |
+| `username:password@hostname:port` | `user:pass@proxy.example:1080` | 按平台说明选择 |
+| `hostname:port@username:password` | `proxy.example:1080@user:pass` | 按平台说明选择 |
+
+自动识别的是字段排列，裸格式的连接协议需要选择。存在多种有效拆分时会拒绝自动猜测，请指定平台格式或使用分项输入。整行 IPv6 入口使用 `[IPv6]:port`，如 `socks5://user:pass@[2001:db8::10]:1080`；免认证可以填写 `proxy.example:1080` 或 `http://proxy.example:8080`。
+
+URI 中凭据的 `@`、`%`、空格等特殊字符应使用百分号编码，例如 `p%40ss%3Aword` 表示 `p@ss:word`；只解码一次。分项输入及三种裸格式按原文字面处理，不能把已经编码的密码当作原文填写。HTTP Basic 的账号不能含冒号，密码可以。暂不支持 NTLM、Digest、PAC、供应商 API/订阅链接、批量列表或任意额外请求头。
+
+平台宣称 HTTP/SOCKS 通用，只说明服务可能接受多种协议；同一个 IP 的不同端口也可能分别提供不同协议。脚本会按选定协议实测，不按 IP、端口或字符串排列猜测，也不静默切换协议。`https://` 指到代理服务器的连接使用 TLS；HTTP CONNECT 代理本身也可以转发 HTTPS 网站，两者含义不同。
+
+脚本先验证代理认证、HTTPS 实际出口和 TCP DNS 回包。新入站的 UDP/53 请求会转为 DNS over TCP，通过该节点自己的代理出口发送。**当前方案要求上游允许 `1.1.1.1:53/TCP`**；HTTP/HTTPS 平台必须允许 CONNECT 到该目标。如果只放行 443，预检会在创建前报错，可改用该供应商提供的可用 SOCKS5 入口；脚本没有直连 DNS 回退，也没有声称所有 HTTP 代理都兼容。HTTP/HTTPS 出口不承载其他 UDP；SOCKS5 的其他 UDP 仍取决于服务本身。
+
+新节点优先使用自己的出口；已有的全局 blackhole 阻断规则会按该入站复制并优先执行，其他入站继续使用原规则及原顺序。启用自定义 `routing.script` 的面板会在修改前停止，需要先人工明确脚本的出口选择策略。
+
+输入完成后，脚本将创建任务交给独立的后台进程，SSH 断开后任务仍会继续。任务先备份面板数据库，再创建禁用的入站，保存并回读对应规则后启用，最后通过本地 Xray 客户端实测 DNS 和 HTTPS。脚本不再因磁盘启动配置未刷新而强制重启 Xray；面板自身在配置无法热应用时仍可能需要重启核心。遇到失败会尝试删除本次入站并清理专属规则，回读确认后记录回滚结果。
+
+前台最多等待 60 秒。任务仍在运行或连接中断时，用菜单 `22` 或以下命令查询：
+
+```bash
+sudo bash install.sh --proxy-node-status
+```
+
+状态 `complete` 表示本地验收完成，`starting` / `running` 表示仍在执行，`failed` 表示修改前失败，`rolled_back` 表示失败后已确认补偿，`manual_recovery_required` 表示无法确认补偿或工作进程中断，需要人工核对。结果包含入站 ID、端口、实际出口 IP、备份和任务目录。任务资料保存在 `/root/3xuish-socks-exit`（或 `$XUI_INFO_DIR/3xuish-socks-exit`），目录权限 0700、文件权限 0600；正常完成或确认回滚后清理凭据工作副本。未完成或待恢复的任务会阻止再次创建。
+
+旧查询命令 `--socks-node-status` 保持有效，沿用原任务目录。默认允许代理服务轮换出口 IP。需要固定出口时，可明确指定预期地址（将示例地址替换为自己的出口；兼容变量名仍为 `SOCKS_EXIT_EXPECTED_IP`）：
+
+```bash
+sudo env SOCKS_EXIT_EXPECTED_IP=203.0.113.10 bash install.sh --add-proxy-node
+```
+
+服务器或云防火墙若有端口白名单，请放行结果中的新 TCP 端口后再从手机验证。本地回环验收不代表手机公网可达；新增节点也不会修改原来手工创建的 REALITY 节点。
+
+代理功能所需组件已嵌入单文件入口，运行时无需再从分支下载。开发者修改 `lib/socks_exit.sh`、`lib/socks_node_probe.py`、`lib/socks_exit_job.py` 或 `lib/proxy_input.py` 后，运行以下命令同步两份发布入口；CI 会检查未同步的发布内容：
+
+```bash
+python3 scripts/sync_socks_helpers.py
+python3 scripts/sync_socks_helpers.py --check
+```
 
 选择 `1` 后，安装向导会询问证书方式、面板账号、端口以及主用节点。主用节点可以选：
 
