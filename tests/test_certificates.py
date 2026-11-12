@@ -68,10 +68,35 @@ class CertificateLifecycle(unittest.TestCase):
                             "-keyout", str(cls.fixture_dir / (name + ".key")),
                             "-out", str(cls.fixture_dir / (name + ".pem"))],
                            check=True, capture_output=True)
-        subprocess.run([openssl, "x509", "-in", str(cls.fixture_dir / "valid.pem"),
-                        "-signkey", str(cls.fixture_dir / "valid.key"), "-days", "-1",
-                        "-out", str(cls.fixture_dir / "expired.pem")],
-                       check=True, capture_output=True)
+        # Newer OpenSSL releases reject negative -days values. Explicit dates
+        # create a genuinely expired certificate on both old and new releases,
+        # with the same key and SANs as the valid fixture.
+        (cls.fixture_dir / "index.txt").write_text("", encoding="ascii")
+        (cls.fixture_dir / "serial").write_text("01\n", encoding="ascii")
+        (cls.fixture_dir / "expired.cnf").write_text("""[ca]
+default_ca = fixture_ca
+[fixture_ca]
+database = index.txt
+serial = serial
+new_certs_dir = .
+private_key = valid.key
+certificate = valid.pem
+default_md = sha256
+default_days = 1
+policy = fixture_policy
+x509_extensions = fixture_extensions
+[fixture_policy]
+commonName = supplied
+[fixture_extensions]
+subjectAltName = DNS:example.test,IP:203.0.113.42
+""", encoding="ascii")
+        subprocess.run([openssl, "req", "-new", "-key", "valid.key",
+                        "-subj", "/CN=example.test", "-out", "expired.csr"],
+                       cwd=cls.fixture_dir, check=True, capture_output=True)
+        subprocess.run([openssl, "ca", "-batch", "-selfsign", "-config", "expired.cnf",
+                        "-in", "expired.csr", "-startdate", "20000101000000Z",
+                        "-enddate", "20000102000000Z", "-notext", "-out", "expired.pem"],
+                       cwd=cls.fixture_dir, check=True, capture_output=True)
 
     @classmethod
     def tearDownClass(cls):
