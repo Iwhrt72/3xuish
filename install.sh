@@ -1522,9 +1522,9 @@ socks_exit_command() {
             cp -- "$source_dir/lib/$name" "$helper" || return 1
         else
             downloaded=0
-            for ref in main codex/reality-target-compatibility; do
+            for ref in codex/reality-target-compatibility main; do
                 if curl -q -fLsS --connect-timeout 10 --max-time 60 \
-                    "https://raw.githubusercontent.com/Iwhrt72/3xuish/$ref/lib/$name" -o "$helper"; then
+                    "https://raw.githubusercontent.com/Iwhrt72/3xuish/$ref/lib/$name" -o "$helper" 2>/dev/null; then
                     actual=$(sha256sum "$helper") || return 1
                     case "$name" in
                         socks_exit.sh) expected="$SOCKS_EXIT_SHA256" ;;
