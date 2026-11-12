@@ -169,3 +169,15 @@ HTTP/HTTPS 上游预检通过临时 Xray 使用将要发布的同一出站配置
 三个独立官方 v3.11.0 容器已分别通过 `SMOKE_PROXY_SCHEME=socks5`、`http`、`https` 的完整 worker 验证，输出 `PROXY_EXIT_SMOKE_OK scheme=...`。HTTP/HTTPS 额外覆盖拒绝 CONNECT53 的真实服务响应：创建前失败，原入站与模板未改变，已有会话仍可用。三种协议均核对核心 PID、原 TCP 会话、专属 DNS 路径、轮换出口与阻断规则。CI 已增加 HTTP/HTTPS 两项真实测试矩阵。完整输入规则与使用限制见 [README](../README.md#添加代理出口节点)。
 
 扩展后的最终完整 Linux 回归为 **241 项通过，0 失败，0 跳过**（166.461 秒）。Bash 语法、ShellCheck、Python 语法、两份入口字节一致性、四个内嵌组件哈希及 `sync_socks_helpers.py --check` 均通过。上述199项是前一修复阶段的记录，241项为多协议扩展后的结果。
+
+## 用户实测反馈：查看全部节点与订阅
+
+用户在服务器选择菜单22后看到 `{"status":"no_previous_job","operation":"socks_exit"}`。该结果只说明没有脚本后台任务记录，却不能回答面板里是否有旧节点，原输出也不适合普通用户阅读。
+
+菜单22已改为“查看全部节点与订阅（含创建结果）”。默认使用中文显示当前面板的全部节点、客户端、启停/到期状态、已有订阅地址与最近创建结果。没有任务记录时仍读取面板节点，并明确说明“这不代表面板中没有节点”。`--proxy-node-status --json` 保留自动化所需的结构化输出；新建任务的前台结果也改用中文。
+
+新增 `lib/node_overview.py`，直接以只读 SQLite 事务读取数据，避免查看时创建管理员令牌或依赖可复用 TLS 入站。新版优先读取 `clients + client_inbounds`，旧版才读取 `inbounds.settings.clients`。订阅按现有 `subId` 分组，沿用面板配置的域名、端口、路径、反代 URI 和 Clash URI；不会自动合并或修改用户身份。TLS 地址不使用 REALITY 的伪装域名，未知地址、关闭订阅、缺少 ID、排除订阅及不支持的协议都有明确提示。
+
+真实官方 v3.11.0 容器已验证4个手工/旧脚本/代理/停用节点，在没有任务历史、旧JSON过时或缺失时仍正确列出。实际请求概览给出的通用和Clash订阅，确认包含对应节点；查看前后 `inbounds`、`clients`、`client_inbounds`、`settings`、`users`、`api_tokens` 均未变化。关闭订阅服务后仍展示节点并解释原因，不提供假定可用的URL。测试入口为 `tests/node_overview_smoke.py`，已加入CI。
+
+输出不包含客户端UUID、密码或私钥；订阅地址属于用户明确要求查看的凭据，仅在终端展示。已经删除的节点无法从当前数据库恢复，配置出的URL也不等于手机公网可达。

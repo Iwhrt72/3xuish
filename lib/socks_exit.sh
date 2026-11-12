@@ -254,7 +254,10 @@ create_socks_exit_node() (
     log_info "创建任务已启动，SSH 断开后仍会继续。任务目录：$job"
     log_info "可用 --proxy-node-status 查询结果。"
     response=$(python3 "$SOCKS_EXIT_JOB_HELPER" wait "$job" --timeout 60) || return 1
-    printf '%s\n' "$response"
+    printf '%s\n' "$response" >"$RUN_DIR/proxy-result.json" || return 1
+    python3 "$NODE_OVERVIEW_HELPER" --database "$XUI_DB_PATH" --info-dir "$XUI_INFO_DIR" \
+        --status-file "$RUN_DIR/proxy-result.json" --state-only ||
+        log_warn "任务结果已保存；请在菜单22查看节点、订阅与创建结果。"
     case "$(jq -r '.status' <<<"$response")" in
         complete|starting|running) return 0 ;;
         *) return 1 ;;
@@ -262,7 +265,13 @@ create_socks_exit_node() (
 )
 
 socks_exit_status_command() {
-    python3 "$SOCKS_EXIT_JOB_HELPER" status --info-dir "$XUI_INFO_DIR"
+    local state_file="$RUN_DIR/overview-task.json"
+    if ! python3 "$SOCKS_EXIT_JOB_HELPER" status --info-dir "$XUI_INFO_DIR" \
+        >"$state_file" 2>"$RUN_DIR/overview-task-error.log"; then
+        printf '{"status":"unavailable"}\n' >"$state_file" || return 1
+    fi
+    python3 "$NODE_OVERVIEW_HELPER" --database "$XUI_DB_PATH" --info-dir "$XUI_INFO_DIR" \
+        --host "${XUI_DOMAIN:-${XUI_SERVER_IP:-}}" --status-file "$state_file" "$@"
 }
 
 create_socks_exit_node_worker() (
