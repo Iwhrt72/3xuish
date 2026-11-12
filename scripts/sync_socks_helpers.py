@@ -23,6 +23,7 @@ HELPERS = (
     ("socks_node_probe.py", "SOCKS_EXIT_PROBE_SHA256"),
     ("socks_exit_job.py", "SOCKS_EXIT_JOB_SHA256"),
     ("proxy_input.py", "PROXY_INPUT_SHA256"),
+    ("node_overview.py", "NODE_OVERVIEW_SHA256"),
 )
 ENTRYPOINTS = ("install.sh", "install_3xui_xhttp_vlessenc.sh")
 

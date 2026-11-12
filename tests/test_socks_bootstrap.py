@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -14,7 +15,7 @@ from test_installer import REPO, bash_directory, run_bash
 from test_installer_menu import script_fixture, execute_fixture
 
 
-HELPERS = ("socks_exit.sh", "socks_node_probe.py", "socks_exit_job.py", "proxy_input.py")
+HELPERS = ("socks_exit.sh", "socks_node_probe.py", "socks_exit_job.py", "proxy_input.py", "node_overview.py")
 
 
 class SocksBootstrap(unittest.TestCase):
@@ -61,6 +62,44 @@ printf 'LOADED_HELPERS\n'
             result = self.load(directory)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assert_extracted(directory)
+
+    def test_view_without_job_history_lists_existing_panel_nodes_and_subscription(self):
+        with tempfile.TemporaryDirectory(prefix="overview-entry-", dir=REPO) as temp:
+            directory = Path(temp)
+            self.fixture(directory)
+            database = directory / "panel.db"
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE inbounds (id INTEGER PRIMARY KEY,remark TEXT,protocol TEXT,"
+                                   "port INTEGER,enable INTEGER,settings TEXT,stream_settings TEXT)")
+                connection.execute("CREATE TABLE settings (key TEXT PRIMARY KEY,value TEXT)")
+                connection.execute("INSERT INTO settings VALUES ('subURI', 'https://sub.example/sub/')")
+                connection.execute("INSERT INTO inbounds VALUES (1,?,?,?,?,?,?)", (
+                    "Previously-created-node", "vless", 26560, 1,
+                    json.dumps({"clients": [{"id": "private-client-uuid", "email": "existing-user",
+                                            "enable": True, "subId": "existing-subscription"}]}),
+                    json.dumps({"network": "tcp", "security": "reality",
+                                "realitySettings": {"privateKey": "private-server-key"}})))
+            connection.close()
+            before = database.read_bytes()
+            alias = 'python3() { python "$@"; }\n' if os.name == "nt" else ""
+            result = run_bash(alias + r'''
+source "$SOCKS_BOOTSTRAP_ROOT/install.sh"
+RUN_DIR="$SOCKS_BOOTSTRAP_ROOT/run"
+XUI_DB_PATH="$SOCKS_BOOTSTRAP_ROOT/panel.db"
+XUI_INFO_DIR="$SOCKS_BOOTSTRAP_ROOT/info"
+curl() { printf 'UNEXPECTED_NETWORK\n'; return 99; }
+api_init() { printf 'UNEXPECTED_TOKEN_CREATION\n'; return 98; }
+socks_node_status_command
+''', extra_env={"SOCKS_BOOTSTRAP_ROOT": bash_directory(directory)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Previously-created-node", result.stdout)
+            self.assertIn("https://sub.example/sub/existing-subscription", result.stdout)
+            self.assertIn("不代表面板中没有节点", result.stdout)
+            for forbidden in ("no_previous_job", '"operation"', "private-client-uuid",
+                              "private-server-key", "UNEXPECTED_NETWORK", "UNEXPECTED_TOKEN_CREATION"):
+                self.assertNotIn(forbidden, result.stdout + result.stderr)
+            self.assertEqual(database.read_bytes(), before)
+            self.assertFalse((directory / "info").exists())
 
     def test_changed_local_shell_is_rejected_before_execution(self):
         with tempfile.TemporaryDirectory(prefix="socks-bootstrap-", dir=REPO) as temp:
@@ -115,18 +154,30 @@ printf 'LOADED_HELPERS\n'
     def test_status_command_and_menu_dispatch_without_maintenance_lock(self):
         overrides = r'''
 acquire_maintenance_lock() { printf 'UNEXPECTED_LOCK\n'; return 91; }
-socks_node_status_command() { printf 'SOCKS_STATUS_SELECTED\n'; }
+socks_node_status_command() { printf 'SOCKS_STATUS_SELECTED:%s\n' "$*"; }
 '''
         with tempfile.TemporaryDirectory(prefix="socks-status-", dir=REPO) as temp:
             directory = Path(temp)
             path = script_fixture(directory, overrides)
             for args, text in ((("--socks-node-status",), ""), (("--proxy-node-status",), ""),
+                               (("--proxy-node-status", "--json"), ""),
                                (("--menu",), "22\n0\n")):
                 with self.subTest(args=args):
                     result = execute_fixture(directory, path, args, text)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn("SOCKS_STATUS_SELECTED", result.stdout)
                     self.assertNotIn("UNEXPECTED_LOCK", result.stdout + result.stderr)
+                    if "--json" in args:
+                        self.assertIn("SOCKS_STATUS_SELECTED:--json", result.stdout)
+
+    def test_status_rejects_unknown_arguments_before_platform_setup(self):
+        result = run_bash(r'''
+source ./install.sh
+init_platform() { printf 'UNEXPECTED_PLATFORM\n'; }
+main --proxy-node-status --invalid
+''')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("UNEXPECTED_PLATFORM", result.stdout)
 
     def test_proxy_menu_and_legacy_alias_share_the_creation_entry(self):
         overrides = r'''

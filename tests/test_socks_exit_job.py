@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -234,7 +235,10 @@ create_socks_exit_node_worker() {
 }
 ''')
         database = self.root / "database"
-        database.touch()
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE inbounds (id INTEGER PRIMARY KEY, remark TEXT, protocol TEXT, "
+                               "port INTEGER, enable INTEGER, settings TEXT, stream_settings TEXT)")
+            connection.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
         script = self.root / "frontend.sh"
         script.write_text(r'''
 source "$REVIEW_SOURCE/installer.sh"
@@ -245,6 +249,7 @@ trap cleanup_install EXIT
 SOCKS_EXIT_PROBE="$REVIEW_SOURCE/probe.py"
 SOCKS_EXIT_JOB_HELPER="$REVIEW_JOB_HELPER"
 PROXY_INPUT_HELPER="$REVIEW_INPUT_HELPER"
+NODE_OVERVIEW_HELPER="$REVIEW_OVERVIEW_HELPER"
 source "$REVIEW_SOURCE/helper.sh"
 acquire_maintenance_lock
 create_socks_exit_node
@@ -253,7 +258,8 @@ socks_exit_status_command
         environment = os.environ.copy()
         environment.update(REVIEW_SOURCE=str(self.source), REVIEW_INFO=str(self.info),
                            REVIEW_DATABASE=str(database), REVIEW_JOB_HELPER=str(REPO / "lib/socks_exit_job.py"),
-                           REVIEW_INPUT_HELPER=str(REPO / "lib/proxy_input.py"))
+                           REVIEW_INPUT_HELPER=str(REPO / "lib/proxy_input.py"),
+                           REVIEW_OVERVIEW_HELPER=str(REPO / "lib/node_overview.py"))
         master, slave = pty.openpty()
         self.addCleanup(lambda: os.close(master))
         process = subprocess.Popen(["bash", str(script)], env=environment,
@@ -278,7 +284,7 @@ socks_exit_status_command
                                   ("代理密码（无认证留空，不回显）：", "private-frontend-password")):
                 read_until(prompt.encode("utf-8"))
                 os.write(master, (value + "\n").encode("utf-8"))
-            read_until(b'"status": "complete"')
+            read_until('创建完成'.encode('utf-8'))
             process.wait(timeout=10)
             while select.select([master], [], [], 0)[0]:
                 try:
