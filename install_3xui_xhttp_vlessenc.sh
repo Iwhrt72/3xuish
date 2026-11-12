@@ -28,6 +28,8 @@ NODE_PROFILES='[]'
 PERFORMANCE_HELPER_SHA256="f2bb9385286065ad700754143de8ce5b8541721f583a1a218c8a697bc2a5ed44"
 SPEED_TEST_SHA256="ad35625188532e12869684997eb919f928aa9b876e3742e3dff6a277e8a2ec0b"
 CLEAN_REINSTALL_SHA256="2c119472f7deade2913e627658342b0833932bc3ada20ea36b04e779db95bb6d"
+SOCKS_EXIT_SHA256="ce35f8f3723487b0f11756bb6adc30e6685fe4ea0232dd6f15b5bf573e8d409b"
+SOCKS_EXIT_PROBE_SHA256="b62221630f3b11ce01c24c82cd5759b3efb09d5e02ced47a952c625739ad3443"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -1510,6 +1512,33 @@ maintenance_command() {
 reinstall_command() { maintenance_command reinstall "$@"; }
 uninstall_command() { maintenance_command uninstall "$@"; }
 
+socks_exit_command() {
+    local source_dir name expected actual helper
+    command -v sha256sum >/dev/null 2>&1 || { fail "未找到 sha256sum。"; return 1; }
+    source_dir="$(cd -- "$(dirname -- "$INSTALLER_SOURCE_FILE")" && pwd)"
+    for name in socks_exit.sh socks_node_probe.py; do
+        helper="$RUN_DIR/$name"
+        if [[ -f "$source_dir/lib/$name" ]]; then
+            cp -- "$source_dir/lib/$name" "$helper" || return 1
+        else
+            curl -q -fLsS --connect-timeout 10 --max-time 60 \
+                "${REPO_RAW_URL%/*}/lib/$name" -o "$helper" || {
+                fail "出口组件下载失败；请使用同一版本的完整仓库。"; return 1;
+            }
+        fi
+        actual=$(sha256sum "$helper") || return 1
+        case "$name" in
+            socks_exit.sh) expected="$SOCKS_EXIT_SHA256" ;;
+            socks_node_probe.py) expected="$SOCKS_EXIT_PROBE_SHA256" ;;
+        esac
+        [[ "${actual%% *}" == "$expected" ]] || { fail "出口组件校验失败：$name"; return 1; }
+    done
+    SOCKS_EXIT_PROBE="$RUN_DIR/socks_node_probe.py"
+    # shellcheck source=lib/socks_exit.sh
+    source "$RUN_DIR/socks_exit.sh"
+    create_socks_exit_node
+}
+
 print_usage() {
     cat <<'USAGE'
 用法：bash install.sh [选项]
@@ -1524,6 +1553,7 @@ print_usage() {
   --repair-performance       原位修复旧参数，可选 --inbound-id ID
   --repair-performance-status 查询最近一次修复结果
   --add-nodes                保留原入站，另加四种节点
+  --add-socks-node           输入 SOCKS5 资料并创建单个出口节点
   --switch-domain 域名       迁移现有节点证书与连接域名
   --help                     显示帮助
 AUTO_YES=1 无参数运行保留无人值守全新安装行为。
@@ -1551,12 +1581,11 @@ prepare_menu_runner() {
     mkdir -p "$RUN_DIR/menu/lib" "$RUN_DIR/menu/scripts"
     MENU_RUNNER_PATH="$RUN_DIR/menu/install.sh"
     cp -- "$INSTALLER_SOURCE_FILE" "$MENU_RUNNER_PATH"
-    if [[ -f "$source_dir/lib/performance_repair.py" ]]; then
-        cp -- "$source_dir/lib/performance_repair.py" "$RUN_DIR/menu/lib/performance_repair.py"
-    fi
-    if [[ -f "$source_dir/lib/clean_reinstall.py" ]]; then
-        cp -- "$source_dir/lib/clean_reinstall.py" "$RUN_DIR/menu/lib/clean_reinstall.py"
-    fi
+    for name in performance_repair.py clean_reinstall.py socks_exit.sh socks_node_probe.py; do
+        if [[ -f "$source_dir/lib/$name" ]]; then
+            cp -- "$source_dir/lib/$name" "$RUN_DIR/menu/lib/$name"
+        fi
+    done
     for name in server-speed-test.sh server_speed_probe.py server_speed_test.py; do
         if [[ -f "$source_dir/scripts/$name" ]]; then
             cp -- "$source_dir/scripts/$name" "$RUN_DIR/menu/scripts/$name"
@@ -1599,9 +1628,10 @@ interactive_menu() {
             '  9) 查看清空重装结果' \
             '  10) 卸载面板与节点（保留私有备份和证书）' \
             '  11) 查看卸载结果' \
+            '  12) 添加 SOCKS5 出口节点' \
             '  0) 退出'
         choice=""
-        if ! menu_read_choice choice '请选择 [0-11]：'; then
+        if ! menu_read_choice choice '请选择 [0-12]：'; then
             printf '\n输入已结束，退出菜单。\n'
             return 0
         fi
@@ -1628,8 +1658,9 @@ interactive_menu() {
             9) menu_run_action --reinstall-status ;;
             10) menu_run_action --uninstall ;;
             11) menu_run_action --uninstall-status ;;
+            12) menu_run_action --add-socks-node ;;
             '') ;;
-            *) log_warn "请输入 0–11。" ;;
+            *) log_warn "请输入 0–12。" ;;
         esac
     done
 }
@@ -1638,7 +1669,7 @@ main() {
     local action="${1:-}"
     case "$action" in
         --help|-h) [[ $# -eq 1 ]] || { fail "帮助选项不能附带其他参数。"; return 1; }; print_usage; return 0 ;;
-        --menu|--install|--add-nodes|--reinstall|--reinstall-status|--uninstall|--uninstall-status)
+        --menu|--install|--add-nodes|--add-socks-node|--reinstall|--reinstall-status|--uninstall|--uninstall-status)
             [[ $# -eq 1 ]] || { fail "${action} 不接受额外参数。"; return 1; } ;;
         --switch-domain)
             [[ $# -le 2 ]] || { fail "--switch-domain 只接受一个域名。"; return 1; } ;;
@@ -1658,6 +1689,7 @@ main() {
         --repair-performance) acquire_maintenance_lock; performance_command repair "${@:2}" ;;
         --repair-performance-status) performance_command status "${@:2}" ;;
         --add-nodes) acquire_maintenance_lock; add_nodes_to_existing ;;
+        --add-socks-node) acquire_maintenance_lock; socks_exit_command ;;
         --switch-domain) acquire_maintenance_lock; switch_existing_to_domain "${2:-}" ;;
         '')
             if [[ "${AUTO_YES:-0}" == 1 ]]; then
