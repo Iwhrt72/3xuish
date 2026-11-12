@@ -252,7 +252,19 @@ def _columns(db, table):
 
 def _client(value, flow=None):
     identity = value.get("uuid") or (value.get("id") if isinstance(value.get("id"), str) else None) or value.get("password") or value.get("auth") or ""
-    return {"email": value.get("email", ""), "identity": identity,
+    # Normalized clients can hold both a UUID and a protocol password. A
+    # stable UUID must not hide a changed Trojan/Hy2/Shadowsocks credential.
+    # Sparse canonical fields also permit migrations to add unused defaults.
+    credentials = {}
+    client_uuid = value.get("uuid") or (value.get("id") if isinstance(value.get("id"), str) else None)
+    password = value.get("password") or value.get("auth")
+    if client_uuid:
+        credentials["uuid"] = client_uuid
+    if password:
+        credentials["password"] = password
+    if value.get("auth") and value.get("password") and value["auth"] != value["password"]:
+        credentials["auth"] = value["auth"]
+    return {"email": value.get("email", ""), "identity": identity, "credentials": credentials,
             "subId": value.get("sub_id", value.get("subId", "")),
             "enable": bool(value.get("enable", True)),
             "expiry": value.get("expiry_time", value.get("expiryTime", 0)),
