@@ -340,6 +340,23 @@ class PanelUpgrade(unittest.TestCase):
         after["inbounds"]["2"] = copy.deepcopy(after["inbounds"]["1"])
         self.assertFalse(upgrade.identities_preserved(self.before, after))
 
+    def test_unchanged_uuid_cannot_hide_changed_protocol_password(self):
+        with closing(sqlite3.connect(self.paths["database"])) as db:
+            db.executescript("CREATE TABLE clients(id INTEGER PRIMARY KEY,email TEXT,uuid TEXT,password TEXT,sub_id TEXT,enable INTEGER);"
+                             "CREATE TABLE client_inbounds(client_id INTEGER,inbound_id INTEGER);")
+            db.execute("INSERT INTO clients VALUES(1,'shared-client','stable-uuid','old-protocol-password','stable-sub',1)")
+            db.execute("INSERT INTO client_inbounds VALUES(1,1)")
+            db.commit()
+            before = upgrade.snapshot_identity(self.paths["database"])
+            db.execute("UPDATE clients SET password='changed-protocol-password'")
+            db.commit()
+        after = upgrade.snapshot_identity(self.paths["database"])
+        self.assertFalse(upgrade.identities_preserved(before, after))
+        legacy = upgrade._client({"id": "same-uuid", "email": "legacy", "subId": "same-sub"})
+        normalized = upgrade._client({"uuid": "same-uuid", "password": "added-unused-default",
+                                      "email": "legacy", "sub_id": "same-sub"})
+        self.assertTrue(upgrade._preserved(legacy, normalized))
+
     def test_missing_orphan_status_is_read_only_and_blocks_next_update(self):
         empty = self.root / "empty-info"
         self.assertEqual(upgrade.read_latest(empty)["status"], "no_previous_job")
