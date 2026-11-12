@@ -15,7 +15,8 @@ from test_installer import REPO, bash_directory, run_bash
 from test_installer_menu import script_fixture, execute_fixture
 
 
-HELPERS = ("socks_exit.sh", "socks_node_probe.py", "socks_exit_job.py", "proxy_input.py", "node_overview.py")
+HELPERS = ("socks_exit.sh", "socks_node_probe.py", "socks_exit_job.py", "proxy_input.py", "node_overview.py",
+           "panel_release.py", "panel_upgrade.py")
 
 
 class SocksBootstrap(unittest.TestCase):

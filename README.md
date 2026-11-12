@@ -40,6 +40,8 @@ bash /tmp/3xuish-install.sh
 20) 回滚到上一次更新前的 Xray 内核
 21) 添加代理出口节点（SOCKS5 / HTTP / HTTPS）
 22) 查看全部节点与订阅（含创建结果）
+23) 升级 3x-ui 面板（保留节点、订阅和内核）
+24) 查看面板升级结果
 0) 退出
 ```
 
@@ -94,7 +96,7 @@ sudo env SOCKS_EXIT_EXPECTED_IP=203.0.113.10 bash install.sh --add-proxy-node
 
 服务器或云防火墙若有端口白名单，请放行结果中的新 TCP 端口后再从手机验证。本地回环验收不代表手机公网可达；新增节点也不会修改原来手工创建的 REALITY 节点。
 
-代理功能所需组件已嵌入单文件入口，运行时无需再从分支下载。开发者修改 `lib/socks_exit.sh`、`lib/socks_node_probe.py`、`lib/socks_exit_job.py`、`lib/proxy_input.py` 或 `lib/node_overview.py` 后，运行以下命令同步两份发布入口；CI 会检查未同步的发布内容：
+代理和面板升级组件已嵌入单文件入口，运行时无需再从分支下载辅助脚本。开发者修改 `lib/socks_exit.sh`、`lib/socks_node_probe.py`、`lib/socks_exit_job.py`、`lib/proxy_input.py`、`lib/node_overview.py`、`lib/panel_release.py` 或 `lib/panel_upgrade.py` 后，运行以下命令同步两份发布入口；CI 会检查未同步的发布内容：
 
 ```bash
 python3 scripts/sync_socks_helpers.py
@@ -132,6 +134,28 @@ bash /tmp/3xuish-install.sh --rollback-xray
 ```
 
 `bash /tmp/3xuish-install.sh --help` 列出全部选项。
+
+## 升级 3x-ui 面板，保留现有配置
+
+菜单 `23` 更新 **3x-ui 面板程序及官方管理脚本**，菜单 `12` 更新 **Xray 核心**；两者独立。面板升级保留当前 Xray/GeoIP 文件、服务配置、节点、管理员账号、证书及订阅，不重新创建节点。
+
+```bash
+bash /tmp/3xuish-install.sh --update-panel
+```
+
+每次查询官方 GitHub 最新稳定版，排除预发布和草稿。如果当前已经是最新版，或本机版本比官方稳定版更新，直接记录“无需升级”，不停止服务、不降级。需要升级时先下载对应架构的官方发行包，验证 SHA-256、归档路径和候选程序版本，准备成功后才停止服务。
+
+升级会短暂中断面板及依赖其 Xray 的连接。独立后台任务持有维护锁，SSH 断开后继续执行；前台最多等待60秒。可用菜单 `24` 或以下命令查看中文结果：
+
+```bash
+bash /tmp/3xuish-install.sh --panel-update-status
+```
+
+任务先备份程序目录、数据库目录及原管理命令，使用 SQLite 一致性备份保留已提交的数据。新面板启动后核对版本、HTTPS/HTTP面板入口、原有监听、节点/客户端身份、账号和订阅配置，并确认原 Xray 文件未被替换。验收失败会先停止新进程，再恢复旧程序和旧数据库；恢复也未通过检查时明确提示人工处理，并保留备份及日志。已有升级处于运行或待恢复状态时，其他脚本维护操作会停止。
+
+备份与结果位于 `/root/3xuish-panel-update/job-*`，仅 root 可访问，不自动删除恢复依据。默认输出“正在执行”“无需升级”“升级完成”“已恢复旧版”或“需要人工检查”；自动化可使用 `--panel-update-status --json`。
+
+当前支持原生默认路径安装、正在运行的 `x-ui` 服务及 SQLite 数据库（`/usr/local/x-ui`、`/etc/x-ui/x-ui.db`），适配 systemd/OpenRC。容器部署、外部数据库、自定义服务/目录及跨文件系统恢复布局会在改动前拒绝，请按原部署方式升级。该功能不会自动升级你的服务器；只有选择菜单23或执行升级命令才会启动任务。
 
 ## 已有服务器清空重装
 

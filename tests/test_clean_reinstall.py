@@ -549,6 +549,42 @@ class CleanReinstall(unittest.TestCase):
         reinstall.require_finished_socks_job()
         self.assertFalse(root.exists())
 
+    def test_panel_upgrade_guard_only_accepts_completed_recovery(self):
+        root = Path(self.paths["info_dir"]) / "3xuish-panel-update"
+        reinstall.require_finished_panel_job()
+        self.assertFalse(root.exists())
+        job = root / "job-20261112T010101Z-0123456789ab"
+        job.mkdir(parents=True)
+        reinstall.atomic_json(root / "latest.json", {"job": job.name})
+        for status in ("complete", "no_update", "failed", "rolled_back", "starting", "running", "manual_recovery_required"):
+            with self.subTest(status=status):
+                reinstall.atomic_json(job / "state.json", {"status": status})
+                if status in ("starting", "running", "manual_recovery_required"):
+                    with self.assertRaises(reinstall.ReinstallError):
+                        reinstall.require_finished_panel_job()
+                else:
+                    reinstall.require_finished_panel_job()
+
+    @unittest.skipUnless(os.name == "posix", "shared maintenance lock requires POSIX flock")
+    def test_interrupted_panel_upgrade_blocks_reset_before_mutation(self):
+        root = Path(self.paths["info_dir"]) / "3xuish-panel-update"
+        job = root / "job-20261112T010101Z-0123456789ab"
+        job.mkdir(parents=True)
+        reinstall.atomic_json(root / "latest.json", {"job": job.name})
+        for operation in ("reinstall", "uninstall"):
+            for state in ('{"status":"running"}', '{"status":"manual_recovery_required"}',
+                          '{"status":[]}', '{broken', '[]'):
+                with self.subTest(operation=operation, state=state):
+                    (job / "state.json").write_text(state, encoding="utf-8")
+                    with mock.patch.object(reinstall.subprocess, "Popen") as launch, \
+                         mock.patch.object(reinstall, "preflight_layout") as preflight:
+                        result = reinstall.launch_reinstall(dict(self.config, operation=operation))
+                    self.assertEqual(result["error"], "previous_panel_upgrade_needs_recovery")
+                    launch.assert_not_called()
+                    preflight.assert_not_called()
+                    self.assertEqual(self.snapshot_managed(), self.before)
+                    self.assertEqual(self.read_rows(), self.before_rows)
+
     def test_completed_socks_history_allows_maintenance_guard(self):
         root = Path(self.paths["info_dir"]) / "3xuish-socks-exit"
         job = root / "job-20261112T010101Z-0123456789ab"
